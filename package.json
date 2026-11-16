@@ -1,0 +1,51 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "seed:admin": "node scripts/seed-admin-accounts.js",
+    "test": "node test_resend_customer_email_otp_e2e.js && node test_partner_auth_and_resend_otp_e2e.js && node test_coupon_system_e2e.js && node test_webrtc_calling_comprehensive_e2e.js && node test_session_validation_after_deletion_e2e.js",
+    "test:session": "node test_session_validation_after_deletion_e2e.js",
+    "test:assignment": "node test_service_based_assignment_e2e.js",
+    "test:webrtc": "node test_webrtc_calling_comprehensive_e2e.js",
+    "test:customer:otp": "node test_resend_customer_email_otp_e2e.js",
+    "test:partner:auth": "node test_partner_auth_and_resend_otp_e2e.js",
+    "test:coupons": "node test_coupon_system_e2e.js",
+    "db:reset:development": "node scripts/reset-development-database.js",
+    "db:reset:development:force": "node scripts/reset-development-database.js --force",
+    "seed:development": "node scripts/seed-development-demo.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@getbrevo/brevo": "^6.2.0",
+    "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.11.0",
+    "compression": "^1.8.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "firebase-admin": "^14.5.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.12.1",
+    "multer": "^2.5.0",
+    "nodemailer": "^10.5.0",
+    "razorpay": "^2.9.8",
+    "resend": "^6.38.1",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.2.0"
+  },
+  "overrides": {
+    "proxy-addr": ">=2.0.8",
+    "body-parser": ">=2.4.0",
+    "follow-redirects": ">=1.16.2",
+    "qs": ">=6.16.1"
+  }
+}
