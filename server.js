@@ -13610,7 +13610,26 @@ async function startServer() {
   try {
     assertProductionSafety();
     console.log('[HomeStepIn Backend] Initializing database connection...');
-    await connectDb();
+
+console.log('[DNS TEST] Checking MongoDB Atlas SRV records...');
+
+try {
+  const srvRecords = await dns.promises.resolveSrv(
+    '_mongodb._tcp.cluster0.xknury1.mongodb.net'
+  );
+
+  console.log('[DNS TEST] SRV records:', srvRecords);
+
+  const txtRecords = await dns.promises.resolveTxt(
+    'cluster0.xknury1.mongodb.net'
+  );
+
+  console.log('[DNS TEST] TXT records:', txtRecords);
+} catch (error) {
+  console.error('[DNS TEST FAILED]', error.code, error.message);
+}
+
+await connectDb();
     await User.init().catch(err => console.warn('[User Index Init Warning]:', err.message));
     await bootstrapDefaultTrichyArea().catch(err => console.warn('[ServiceArea Bootstrap Warning]:', err.message));
     await User.updateMany(
