@@ -138,23 +138,25 @@ async function connectDb() {
 
   connectionPromise = (async () => {
     const isProduction = process.env.NODE_ENV === 'production';
+    const isCloud = isProduction || Boolean(process.env.RENDER) || Boolean(process.env.RAILWAY_ENVIRONMENT) || Boolean(process.env.VERCEL) || Boolean(process.env.FLY_APP_NAME);
     const isTest = process.env.NODE_ENV === 'test';
     const requestedUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/homestepin';
     const totalWorkers = parseInt(process.env.CLUSTER_TOTAL_WORKERS || '1', 10);
     const maxPoolSize = Math.max(15, Math.floor(100 / totalWorkers));
     const minPoolSize = Math.max(2, Math.floor(10 / totalWorkers));
+    const isRemote = isRemoteMongoUri(requestedUri);
 
     // ── PATH A: Cloud / Remote Deployment (Atlas, AWS, Docker Container) ──
-    if (isProduction || isRemoteMongoUri(requestedUri)) {
+    if (isCloud || isRemote) {
       console.log(`[MongoDB] Connecting to remote/cloud database cluster...`);
       let lastErr = null;
-      const maxAttempts = isProduction ? 3 : 1;
+      const maxAttempts = isCloud ? 3 : 1;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
           const connectOptions = {
             maxPoolSize,
             minPoolSize,
-            serverSelectionTimeoutMS: isProduction ? 15000 : 3000,
+            serverSelectionTimeoutMS: isCloud ? 15000 : 5000,
             socketTimeoutMS: 45000,
           };
           if (!requestedUri.startsWith('mongodb+srv://') && process.env.MONGO_FORCE_IPV4 === 'true') {
@@ -169,16 +171,19 @@ async function connectDb() {
         } catch (err) {
           lastErr = err;
           console.warn(`[MongoDB Warning] Remote connection attempt ${attempt} failed: ${err.message}`);
-          if (attempt < 3) {
+          if (attempt < maxAttempts) {
             await new Promise(r => setTimeout(r, attempt * 1500));
           }
         }
       }
       dbStatus.lastError = lastErr?.message;
-      if (!isProduction) {
+      if (!isCloud && !isRemote) {
         console.warn(`[MongoDB Fallback] Remote cluster unreachable (check IP whitelist at https://cloud.mongodb.com/v2#/security/network/accessList). Falling back to persistent local MongoDB engine for development.`);
       } else {
-        throw lastErr || new Error('Failed to connect to remote MongoDB cluster.');
+        const errorDetail = `Failed to connect to remote MongoDB cluster (${sanitizeUri(requestedUri)}): ${lastErr?.message || 'Unknown network error'}. ` +
+          `Verify: 1) MongoDB Atlas Network Access IP whitelist (allow 0.0.0.0/0 for cloud hosts), 2) Database user credentials and cluster status, 3) Correct SRV or standard URI format.`;
+        console.error(`[MongoDB Fatal] ${errorDetail}`);
+        throw lastErr || new Error(errorDetail);
       }
     }
 
@@ -273,10 +278,13 @@ async function connectDb() {
         instanceConfig.storageEngine = 'wiredTiger';
       }
 
+      const binaryOptions = {};
+      if (process.env.MONGODB_MEMORY_VERSION) {
+        binaryOptions.version = process.env.MONGODB_MEMORY_VERSION;
+      }
+
       mongoServer = await MongoMemoryServer.create({
-        binary: {
-          version: '4.4.26',
-        },
+        binary: binaryOptions,
         instance: instanceConfig,
       });
 
