@@ -36,14 +36,18 @@ async function bootstrapSystemDefaults() {
   ];
 
   for (const cat of defaultCategories) {
-    const existing = await Category.findOne({
-      $or: [
-        { name: cat.name },
-        { slug: cat.slug },
-      ],
-    });
-    if (!existing) {
-      await Category.create(cat);
+    try {
+      const existing = await Category.findOne({
+        $or: [
+          { name: cat.name },
+          { slug: cat.slug },
+        ],
+      });
+      if (!existing) {
+        await Category.create(cat);
+      }
+    } catch (catErr) {
+      console.warn(`[DB Bootstrap Warning] Category '${cat.name}' notice:`, catErr.message);
     }
   }
 
@@ -60,14 +64,18 @@ async function bootstrapSystemDefaults() {
   ];
 
   for (const srv of defaultServices) {
-    const existing = await Service.findOne({ customId: srv.customId });
-    if (!existing) {
-      await Service.create(srv);
-    } else {
-      await Service.updateOne({ customId: srv.customId }, { $set: { is_visible: existing.is_visible !== undefined ? existing.is_visible : true, displayOrder: existing.displayOrder || srv.displayOrder } });
+    try {
+      const existing = await Service.findOne({ customId: srv.customId });
+      if (!existing) {
+        await Service.create(srv);
+      } else {
+        await Service.updateOne({ customId: srv.customId }, { $set: { is_visible: existing.is_visible !== undefined ? existing.is_visible : true, displayOrder: existing.displayOrder || srv.displayOrder } });
+      }
+    } catch (srvErr) {
+      console.warn(`[DB Bootstrap Warning] Service '${srv.customId}' notice:`, srvErr.message);
     }
   }
-  await Service.updateMany({ is_visible: { $exists: false } }, { $set: { is_visible: true } });
+  await Service.updateMany({ is_visible: { $exists: false } }, { $set: { is_visible: true } }).catch(() => {});
 
   // 3. Coupons (Only seeded if explicitly requested via SEED_DEFAULT_COUPONS=true)
   if (process.env.SEED_DEFAULT_COUPONS === 'true') {
@@ -79,20 +87,28 @@ async function bootstrapSystemDefaults() {
       { code: 'FIRST100', title: 'First Booking Special', description: 'Special ₹100 discount for valued customers', amount: 100, percent: 15, minOrderAmount: 350, maxDiscount: 150, is_visible: true, active: true, displayOrder: 5 },
     ];
     for (const c of defaultCoupons) {
-      const existing = await Coupon.findOne({ code: c.code });
-      if (!existing) {
-        await Coupon.create(c);
-      } else {
-        await Coupon.updateOne({ code: c.code }, { $set: { is_visible: existing.is_visible !== undefined ? existing.is_visible : true, displayOrder: existing.displayOrder || c.displayOrder } });
+      try {
+        const existing = await Coupon.findOne({ code: c.code });
+        if (!existing) {
+          await Coupon.create(c);
+        } else {
+          await Coupon.updateOne({ code: c.code }, { $set: { is_visible: existing.is_visible !== undefined ? existing.is_visible : true, displayOrder: existing.displayOrder || c.displayOrder } });
+        }
+      } catch (couponErr) {
+        console.warn(`[DB Bootstrap Warning] Coupon '${c.code}' notice:`, couponErr.message);
       }
     }
-    await Coupon.updateMany({ is_visible: { $exists: false } }, { $set: { is_visible: true } });
+    await Coupon.updateMany({ is_visible: { $exists: false } }, { $set: { is_visible: true } }).catch(() => {});
   }
 
   // 4. Platform Settings
-  const existingSetting = await PlatformSetting.findOne({ key: 'global_config' });
-  if (!existingSetting) {
-    await PlatformSetting.create({ key: 'global_config' });
+  try {
+    const existingSetting = await PlatformSetting.findOne({ key: 'global_config' });
+    if (!existingSetting) {
+      await PlatformSetting.create({ key: 'global_config' });
+    }
+  } catch (settingErr) {
+    console.warn('[DB Bootstrap Warning] PlatformSetting notice:', settingErr.message);
   }
 
   // 5. System Administrator Accounts (Permanent Super Admins: Fazil & Vinothan)
@@ -123,60 +139,66 @@ async function bootstrapSystemDefaults() {
   ];
 
   for (const adm of initialSuperAdmins) {
-    const existingAdmin = await User.findOne({ email: adm.email }).select('+passwordHash');
-    if (!existingAdmin) {
-      const passwordHash = await bcrypt.hash(adm.password, 10);
-      const customId = `usr_adm_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
-      await User.create({
-        customId,
-        name: adm.displayName,
-        email: adm.email,
-        phone: adm.phone,
-        passwordHash,
-        role: 'admin',
-        adminRole: 'SUPER_ADMIN',
-        isSystemSuperAdmin: true,
-        isProtected: true,
-        status: 'active',
-        emailVerified: true,
-        mustChangePassword: false,
-      });
-      console.log(`[DB Bootstrap] Provisioned initial Super Admin: ${adm.email} (isSystemSuperAdmin: true)`);
-    } else {
-      let needsSave = false;
-      if (existingAdmin.role !== 'admin') {
-        existingAdmin.role = 'admin';
-        needsSave = true;
-      }
-      if (existingAdmin.adminRole !== 'SUPER_ADMIN') {
-        existingAdmin.adminRole = 'SUPER_ADMIN';
-        needsSave = true;
-      }
-      if (!existingAdmin.isSystemSuperAdmin) {
-        existingAdmin.isSystemSuperAdmin = true;
-        needsSave = true;
-      }
-      if (!existingAdmin.isProtected) {
-        existingAdmin.isProtected = true;
-        needsSave = true;
-      }
-      if (existingAdmin.status !== 'active') {
-        existingAdmin.status = 'active';
-        needsSave = true;
-      }
-      // Synchronize password to specified initial credentials
-      const isMatch = await bcrypt.compare(adm.password, existingAdmin.passwordHash || '');
-      if (!isMatch) {
-        existingAdmin.passwordHash = await bcrypt.hash(adm.password, 10);
-        existingAdmin.mustChangePassword = false;
-        needsSave = true;
-        console.log(`[DB Bootstrap] Synchronized initial credentials for Super Admin: ${adm.email}`);
-      }
+    try {
+      const existingAdmin = await User.findOne({
+        $or: [{ email: adm.email }, { phone: adm.phone }],
+      }).select('+passwordHash');
+      if (!existingAdmin) {
+        const passwordHash = await bcrypt.hash(adm.password, 10);
+        const customId = `usr_adm_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
+        await User.create({
+          customId,
+          name: adm.displayName,
+          email: adm.email,
+          phone: adm.phone,
+          passwordHash,
+          role: 'admin',
+          adminRole: 'SUPER_ADMIN',
+          isSystemSuperAdmin: true,
+          isProtected: true,
+          status: 'active',
+          emailVerified: true,
+          mustChangePassword: false,
+        });
+        console.log(`[DB Bootstrap] Provisioned initial Super Admin: ${adm.email} (isSystemSuperAdmin: true)`);
+      } else {
+        let needsSave = false;
+        if (existingAdmin.role !== 'admin') {
+          existingAdmin.role = 'admin';
+          needsSave = true;
+        }
+        if (existingAdmin.adminRole !== 'SUPER_ADMIN') {
+          existingAdmin.adminRole = 'SUPER_ADMIN';
+          needsSave = true;
+        }
+        if (!existingAdmin.isSystemSuperAdmin) {
+          existingAdmin.isSystemSuperAdmin = true;
+          needsSave = true;
+        }
+        if (!existingAdmin.isProtected) {
+          existingAdmin.isProtected = true;
+          needsSave = true;
+        }
+        if (existingAdmin.status !== 'active') {
+          existingAdmin.status = 'active';
+          needsSave = true;
+        }
+        // Synchronize password to specified initial credentials
+        const isMatch = await bcrypt.compare(adm.password, existingAdmin.passwordHash || '');
+        if (!isMatch) {
+          existingAdmin.passwordHash = await bcrypt.hash(adm.password, 10);
+          existingAdmin.mustChangePassword = false;
+          needsSave = true;
+          console.log(`[DB Bootstrap] Synchronized initial credentials for Super Admin: ${adm.email}`);
+        }
 
-      if (needsSave) {
-        await existingAdmin.save();
-        console.log(`[DB Bootstrap] Verified and updated permanent Super Admin status for: ${adm.email}`);
+        if (needsSave) {
+          await existingAdmin.save();
+          console.log(`[DB Bootstrap] Verified and updated permanent Super Admin status for: ${adm.email}`);
+        }
       }
+    } catch (adminErr) {
+      console.warn(`[DB Bootstrap Warning] Admin '${adm.email}' notice:`, adminErr.message);
     }
   }
 

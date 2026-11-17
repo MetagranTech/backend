@@ -13618,7 +13618,7 @@ async function startServer() {
       { $set: { serviceArea: 'Cantonment, Thillai Nagar, Tiruchirappalli (Trichy)' } }
     ).catch(err => console.warn('[Worker ServiceArea Migration Warning]:', err.message));
     if (process.env.NODE_ENV !== 'production' || process.env.SEED_DATABASE === 'true') {
-      await seedDatabase();
+      await seedDatabase().catch(err => console.warn('[DB Seed Warning]:', err.message));
     }
     await backfillLegacyCompletedBookings().catch(err => console.warn('[Backfill Warning]:', err));
     await Booking.updateMany(
@@ -13650,7 +13650,7 @@ async function startServer() {
       console.log(`[HomeStepIn Backend API & WS] Running on http://0.0.0.0:${config.port} (WS on /ws)`);
     });
   } catch (err) {
-    console.error('[HomeStepIn Startup Error] Failed to start server:', err);
+    console.error('[HomeStepIn Startup Error] Failed to start server:', err.stack || err);
     process.exit(1);
   }
 }
