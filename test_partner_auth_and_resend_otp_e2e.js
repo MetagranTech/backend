@@ -14,6 +14,8 @@
 
 'use strict';
 
+process.env.NODE_ENV = 'test';
+
 const http = require('http');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');

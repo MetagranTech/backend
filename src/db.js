@@ -96,10 +96,31 @@ function isPortListening(host, port, timeoutMs = 300) {
   });
 }
 
+function sanitizeMongoUri(rawUri) {
+  if (!rawUri || typeof rawUri !== 'string') return '';
+  let uri = rawUri.trim().replace(/[\u200B-\u200D\uFEFF]/g, '');
+  uri = uri.replace(/^(MONGODB_URI|MONGO_URI|DATABASE_URL)\s*=\s*/i, '').trim();
+  while (
+    (uri.startsWith('"') && uri.endsWith('"')) ||
+    (uri.startsWith("'") && uri.endsWith("'")) ||
+    (uri.startsWith('“') && uri.endsWith('”')) ||
+    (uri.startsWith('‘') && uri.endsWith('’'))
+  ) {
+    uri = uri.slice(1, -1).trim();
+  }
+  return uri.replace(/^['"]+|['"]+$/g, '').trim();
+}
+
+function isValidMongoScheme(uri) {
+  if (!uri || typeof uri !== 'string') return false;
+  return /^mongodb(\+srv)?:\/\//i.test(uri);
+}
+
 function isRemoteMongoUri(uri) {
   if (!uri || typeof uri !== 'string') return false;
-  if (uri.startsWith('mongodb+srv://')) return true;
-  const lower = uri.toLowerCase();
+  const cleaned = sanitizeMongoUri(uri);
+  if (cleaned.startsWith('mongodb+srv://')) return true;
+  const lower = cleaned.toLowerCase();
   return !lower.includes('127.0.0.1') && !lower.includes('localhost') && !lower.includes('::1');
 }
 
@@ -122,6 +143,47 @@ function sanitizeUri(uri) {
   return uri.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@');
 }
 
+function getSafeUriDiagnostics(rawUri, sanitizedUri) {
+  const raw = rawUri || '';
+  const sanitized = sanitizedUri || '';
+  const schemeMatch = sanitized.match(/^mongodb(\+srv)?:\/\//i);
+  const scheme = schemeMatch ? schemeMatch[0] : 'INVALID_OR_MISSING';
+
+  let masked = '[no credentials]';
+  let host = 'unknown';
+  let dbName = 'unknown';
+
+  if (isValidMongoScheme(sanitized)) {
+    try {
+      masked = sanitizeUri(sanitized);
+      const withoutScheme = sanitized.replace(/^mongodb(?:\+srv)?:\/\//i, '');
+      const hostPart = withoutScheme.split('/')[0].split('@').pop() || '';
+      host = hostPart.split('?')[0];
+
+      const afterSlash = withoutScheme.split('/')[1];
+      if (afterSlash) {
+        dbName = afterSlash.split('?')[0] || '';
+      }
+    } catch {
+      masked = '[masking-error]';
+    }
+  }
+
+  const rawPrefix = raw.length >= 12 ? raw.substring(0, 12) : raw;
+  const rawSuffix = raw.length >= 6 ? raw.substring(raw.length - 6) : raw;
+
+  return {
+    rawLength: raw.length,
+    sanitizedLength: sanitized.length,
+    scheme,
+    host,
+    dbName,
+    maskedUri: masked,
+    rawPrefix: JSON.stringify(rawPrefix),
+    rawSuffix: JSON.stringify(rawSuffix),
+  };
+}
+
 // ── Database Connection Manager ───────────────────────────────────────
 
 async function connectDb() {
@@ -138,26 +200,40 @@ async function connectDb() {
 
   connectionPromise = (async () => {
     const isProduction = process.env.NODE_ENV === 'production';
-    const isCloud = isProduction || Boolean(process.env.RENDER) || Boolean(process.env.RAILWAY_ENVIRONMENT) || Boolean(process.env.VERCEL) || Boolean(process.env.FLY_APP_NAME);
     const isTest = process.env.NODE_ENV === 'test';
-    const requestedUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/homestepin';
+
+    const rawUri = process.env.MONGODB_URI || process.env.MONGO_URI || (!isProduction ? 'mongodb://127.0.0.1:27017/homestepin' : '');
+    const requestedUri = sanitizeMongoUri(rawUri);
     const totalWorkers = parseInt(process.env.CLUSTER_TOTAL_WORKERS || '1', 10);
     const maxPoolSize = Math.max(15, Math.floor(100 / totalWorkers));
     const minPoolSize = Math.max(2, Math.floor(10 / totalWorkers));
-    const isRemote = isRemoteMongoUri(requestedUri);
+
+    const diag = getSafeUriDiagnostics(rawUri, requestedUri);
+
+    // Strict validation for production mode
+    if (isProduction) {
+      if (!requestedUri || !isValidMongoScheme(requestedUri)) {
+        console.error(`[MongoDB Fatal] Invalid MongoDB connection string in production.`);
+        console.error(`[MongoDB Diagnostics] rawLength: ${diag.rawLength}, prefix: ${diag.rawPrefix}, scheme: ${diag.scheme}`);
+        throw new Error(
+          `[MongoDB Fatal] Invalid scheme in MONGODB_URI. Expected connection string to start with "mongodb://" or "mongodb+srv://", but received prefix ${diag.rawPrefix} (raw length: ${diag.rawLength}). Check the MONGODB_URI environment variable on Render.`
+        );
+      }
+    }
 
     // ── PATH A: Cloud / Remote Deployment (Atlas, AWS, Docker Container) ──
-    if (isCloud || isRemote) {
-      console.log(`[MongoDB] Connecting to remote/cloud database cluster...`);
+    if (isProduction || isRemoteMongoUri(requestedUri)) {
+      console.log(`[MongoDB] Connecting to remote cluster: host=${diag.host}, db=${diag.dbName}, scheme=${diag.scheme}, uriLength=${diag.sanitizedLength}...`);
       let lastErr = null;
-      const maxAttempts = isCloud ? 3 : 1;
+      const maxAttempts = isProduction ? 3 : 1;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
           const connectOptions = {
             maxPoolSize,
             minPoolSize,
-            serverSelectionTimeoutMS: isCloud ? 15000 : 5000,
+            serverSelectionTimeoutMS: isProduction ? 15000 : 3000,
             socketTimeoutMS: 45000,
+            autoIndex: !isProduction,
           };
           if (!requestedUri.startsWith('mongodb+srv://') && process.env.MONGO_FORCE_IPV4 === 'true') {
             connectOptions.family = 4;
@@ -167,24 +243,27 @@ async function connectDb() {
           dbStatus.uri = sanitizeUri(requestedUri);
           dbStatus.source = 'cloud-remote';
           dbStatus.lastError = null;
+          console.log(`[MongoDB] Connected successfully to remote database: ${diag.maskedUri}`);
           return mongoose.connection;
         } catch (err) {
           lastErr = err;
-          console.warn(`[MongoDB Warning] Remote connection attempt ${attempt} failed: ${err.message}`);
+          console.warn(`[MongoDB Warning] Remote connection attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
           if (attempt < maxAttempts) {
             await new Promise(r => setTimeout(r, attempt * 1500));
           }
         }
       }
       dbStatus.lastError = lastErr?.message;
-      if (!isCloud && !isRemote) {
+      if (!isProduction) {
         console.warn(`[MongoDB Fallback] Remote cluster unreachable (check IP whitelist at https://cloud.mongodb.com/v2#/security/network/accessList). Falling back to persistent local MongoDB engine for development.`);
       } else {
-        const errorDetail = `Failed to connect to remote MongoDB cluster (${sanitizeUri(requestedUri)}): ${lastErr?.message || 'Unknown network error'}. ` +
-          `Verify: 1) MongoDB Atlas Network Access IP whitelist (allow 0.0.0.0/0 for cloud hosts), 2) Database user credentials and cluster status, 3) Correct SRV or standard URI format.`;
-        console.error(`[MongoDB Fatal] ${errorDetail}`);
-        throw lastErr || new Error(errorDetail);
+        throw new Error(`[MongoDB Fatal] Remote MongoDB cluster unreachable in production after ${maxAttempts} attempts: ${lastErr?.message}. Aborting startup.`);
       }
+    }
+
+    // Explicit guard: In production, NEVER proceed to Path B!
+    if (isProduction) {
+      throw new Error(`[MongoDB Fatal] Production environment requires a valid remote MongoDB connection. Local database fallback is strictly disabled.`);
     }
 
     // ── PATH B: Local Development & Staging ──────────────────────────────
@@ -278,13 +357,10 @@ async function connectDb() {
         instanceConfig.storageEngine = 'wiredTiger';
       }
 
-      const binaryOptions = {};
-      if (process.env.MONGODB_MEMORY_VERSION) {
-        binaryOptions.version = process.env.MONGODB_MEMORY_VERSION;
-      }
-
       mongoServer = await MongoMemoryServer.create({
-        binary: binaryOptions,
+        binary: {
+          version: '4.4.26',
+        },
         instance: instanceConfig,
       });
 
@@ -304,17 +380,6 @@ async function connectDb() {
       dbStatus.source = 'persistent-embedded';
       dbStatus.lastError = null;
       console.log(`[MongoDB] Persistent database online using WiredTiger engine at ${dataDir || 'in-memory'}`);
-
-      // Clean legacy indexes if present
-      try {
-        const msgCol = mongoose.connection.collection('messages');
-        const indexes = await msgCol.indexes();
-        const legacyIdx = indexes.find(i => i.name === 'bookingId_1_clientMsgId_1');
-        if (legacyIdx) {
-          await msgCol.dropIndex('bookingId_1_clientMsgId_1');
-          console.log('[MongoDB] Dropped legacy bookingId_1_clientMsgId_1 index for clean schema synchronization');
-        }
-      } catch {}
 
       return mongoose.connection;
     } catch (embeddedErr) {

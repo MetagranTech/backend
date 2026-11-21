@@ -71,19 +71,7 @@ const {
   canResend,
   verifyOtpForUser,
 } = otpService;
-const {
-  verifyFirebaseEmailToken,
-  markTokenAsUsed,
-  sendFirebaseVerificationEmail,
-  sendFirebasePasswordResetEmail,
-  generateFirebasePasswordResetLink,
-  generateFirebaseEmailVerificationLink,
-  getFirebaseUserByEmail,
-  syncFirebaseUser,
-  setFirebaseUserEmailVerified,
-  getFirebaseStatus,
-  FIREBASE_WEB_API_KEY,
-} = require('./src/services/firebaseService');
+const oneSignalService = require('./src/services/oneSignalService');
 const resendService = require('./src/services/resendService');
 const couponService = require('./src/services/couponService');
 const razorpayService = require('./src/services/razorpayService');
@@ -255,6 +243,12 @@ function isCanonicalCompletedStatus(status) {
     'DONE',
     'FINISHED',
   ].includes(s);
+}
+
+const CANONICAL_WORKER_ROLES = ['worker', 'Worker', 'WORKER', 'partner', 'Partner', 'PARTNER', 'technician', 'Technician'];
+function isWorkerRole(role) {
+  if (!role) return false;
+  return CANONICAL_WORKER_ROLES.includes(String(role).trim());
 }
 
 function isCommunicationDisabledForBooking(booking) {
@@ -2315,60 +2309,6 @@ function formatCustomerAddress(addrObj) {
 
 // Single Unified Login Screen (role returned authoritatively from DB)
 app.post('/api/auth/login', authRateLimiter, async (req, res) => {
-  // Support direct Firebase ID Token Login
-  if (req.body.firebaseIdToken) {
-    try {
-      const fbResult = await verifyFirebaseEmailToken(req.body.firebaseIdToken);
-      const user = await User.findOne({ email: fbResult.email });
-      if (!user) {
-        return res.status(404).json({ error: 'No account found with this email. Please register first.', code: 'USER_NOT_FOUND' });
-      }
-      if (user.status === 'disabled' || user.status === 'suspended') {
-        return res.status(403).json({ error: 'Your account has been deactivated. Contact support.', code: 'ACCOUNT_DISABLED' });
-      }
-      const expectedRole = req.body.expectedRole || req.query.expectedRole || req.headers['x-app-role'];
-      if (expectedRole && expectedRole !== user.role) {
-        return res.status(403).json({ error: 'Role mismatch. Please sign in with the correct application.', code: 'ROLE_MISMATCH' });
-      }
-      if (user.role === 'customer' && !fbResult.emailVerified && !user.emailVerified) {
-        return res.status(403).json({
-          error: 'Please verify your email address before signing in.',
-          code: 'EMAIL_NOT_VERIFIED',
-          email: user.email,
-          role: user.role,
-        });
-      }
-      if (fbResult.emailVerified && !user.emailVerified) {
-        user.emailVerified = true;
-      }
-      user.firebaseUid = fbResult.uid;
-      user.lastLoginAt = new Date();
-      await user.save();
-      const token = generateToken(user);
-      return res.json({
-        token,
-        user: {
-          id: user.customId || user._id.toString(),
-          _id: user._id.toString(),
-          name: user.name,
-          email: user.email,
-          phone: user.phone,
-          employeeId: user.employeeId,
-          role: user.role,
-          adminRole: user.adminRole || (user.isSystemSuperAdmin ? 'SUPER_ADMIN' : 'BASIC_ADMIN'),
-          isSystemSuperAdmin: Boolean(user.isSystemSuperAdmin),
-          isProtected: Boolean(user.isProtected),
-          status: user.status,
-          kycStatus: user.kycStatus,
-          emailVerified: Boolean(user.emailVerified),
-          mustChangePassword: Boolean(user.mustChangePassword),
-        },
-      });
-    } catch (fbErr) {
-      return res.status(fbErr.status || 401).json({ error: fbErr.message || 'Firebase authentication failed.' });
-    }
-  }
-
   const identifier = req.body.identifier || req.body.email || req.body.phone;
   const password = req.body.password;
   if (!identifier || !password) {
@@ -2449,25 +2389,12 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
   // Server-side Email Verification Gate for Customer Accounts Only (Worker accounts are provisioned by Admin)
   if (user.role === 'customer') {
     if (!user.emailVerified) {
-      // Check Firebase in case user verified their email via link outside the app
-      if (user.email) {
-        try {
-          const fbUser = await getFirebaseUserByEmail(user.email);
-          if (fbUser && fbUser.emailVerified) {
-            user.emailVerified = true;
-            await user.save();
-          }
-        } catch (_) {}
-      }
-
-      if (!user.emailVerified) {
-        return res.status(403).json({
-          error: 'Please verify your email address before signing in. Check your inbox for the verification code.',
-          code: 'EMAIL_NOT_VERIFIED',
-          email: user.email,
-          role: user.role,
-        });
-      }
+      return res.status(403).json({
+        error: 'Please verify your email address before signing in. Check your inbox for the verification code.',
+        code: 'EMAIL_NOT_VERIFIED',
+        email: user.email,
+        role: user.role,
+      });
     }
   }
 
@@ -2479,6 +2406,8 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
     user: {
       id: user.customId || user._id.toString(),
       _id: user._id.toString(),
+      customId: user.customId || user._id.toString(),
+      username: user.username || user.employeeId || '',
       name: user.name,
       email: user.email,
       phone: user.phone,
@@ -2558,8 +2487,13 @@ app.post(['/api/auth/refresh', '/api/auth/refresh-token'], async (req, res) => {
       token: newToken,
       user: {
         id: user.customId || user._id.toString(),
+        _id: user._id.toString(),
+        customId: user.customId || user._id.toString(),
+        username: user.username || user.employeeId || '',
         name: user.name,
         email: user.email,
+        phone: user.phone,
+        employeeId: user.employeeId,
         role: user.role,
         status: user.status,
       },
@@ -2602,8 +2536,10 @@ app.post('/api/auth/verify-otp', authRateLimiter, async (req, res) => {
           const isWorker = pending.role === 'worker';
           const customId = isWorker ? `usr_work_${Date.now()}` : `usr_cust_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
           const employeeId = isWorker ? (pending.employeeId || `EMP-W${Date.now().toString().slice(-6)}`) : undefined;
+          const username = (employeeId || customId).toLowerCase().replace(/[^a-z0-9_-]/g, '');
           user = await User.create({
             customId,
+            username,
             employeeId,
             name: pending.name,
             email: challenge.email,
@@ -2654,6 +2590,8 @@ app.post('/api/auth/verify-otp', authRateLimiter, async (req, res) => {
         user: {
           id: user.customId || user._id.toString(),
           _id: user._id.toString(),
+          customId: user.customId || user._id.toString(),
+          username: user.username || user.employeeId || '',
           name: user.name,
           email: user.email,
           phone: user.phone,
@@ -2690,6 +2628,8 @@ app.post('/api/auth/verify-otp', authRateLimiter, async (req, res) => {
         user: {
           id: user.customId || user._id.toString(),
           _id: user._id.toString(),
+          customId: user.customId || user._id.toString(),
+          username: user.username || user.employeeId || '',
           name: user.name,
           email: user.email,
           phone: user.phone,
@@ -2842,69 +2782,7 @@ app.get(['/api/auth/registration-config', '/api/auth/email-eligibility'], (req, 
   });
 });
 
-// Public Firebase Client Configuration for Mobile Apps (Safe, zero secrets exposed)
-app.get('/api/auth/firebase-config', (req, res) => {
-  const status = getFirebaseStatus();
-  return res.json({
-    success: true,
-    configured: status.configured,
-    projectId: status.projectId,
-    apiKey: FIREBASE_WEB_API_KEY,
-    authDomain: `${status.projectId}.firebaseapp.com`,
-  });
-});
 
-// Firebase Email Token Verification & User Activation Endpoint
-app.post('/api/auth/verify-firebase-email', authRateLimiter, async (req, res) => {
-  try {
-    const { firebaseIdToken, email } = req.body;
-    if (!firebaseIdToken) {
-      return res.status(400).json({ error: 'firebaseIdToken is required.', code: 'TOKEN_REQUIRED' });
-    }
-
-    const fbResult = await verifyFirebaseEmailToken(firebaseIdToken, email);
-    const user = await User.findOne({ email: fbResult.email });
-    if (!user) {
-      return res.status(404).json({ error: 'No account found with this email. Please register first.', code: 'USER_NOT_FOUND' });
-    }
-
-    if (!fbResult.emailVerified) {
-      return res.status(403).json({
-        success: false,
-        emailVerified: false,
-        error: 'Your email address is not yet verified. Please click the verification link in your email.',
-        code: 'EMAIL_NOT_VERIFIED',
-        email: user.email,
-      });
-    }
-
-    user.emailVerified = true;
-    user.firebaseUid = fbResult.uid;
-    user.lastLoginAt = new Date();
-    await user.save();
-    markTokenAsUsed(firebaseIdToken);
-
-    const token = generateToken(user);
-    return res.status(200).json({
-      success: true,
-      message: 'Email successfully verified via Firebase!',
-      token,
-      user: {
-        id: user.customId || user._id.toString(),
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        emailVerified: true,
-      },
-    });
-  } catch (err) {
-    return res.status(err.status || 400).json({
-      error: err.message,
-      code: err.code || 'FIREBASE_VERIFICATION_FAILED',
-    });
-  }
-});
 
 // Resend Verification Email or OTP
 app.post(['/api/auth/resend-verification-email', '/api/auth/resend-verification-otp'], authRateLimiter, async (req, res) => {
@@ -2930,23 +2808,7 @@ app.post(['/api/auth/resend-verification-email', '/api/auth/resend-verification-
       return res.status(400).json({ error: 'This email address is already verified. You can sign in now.' });
     }
 
-    // Partner/worker account preserves Firebase verification email link flow
-    if (user.role === 'worker') {
-      let verificationLink = null;
-      try {
-        verificationLink = await generateFirebaseEmailVerificationLink(normalizedEmail);
-      } catch (fbErr) {
-        console.warn('[Firebase Verification Link Warning]:', fbErr.message);
-      }
-      return res.status(200).json({
-        success: true,
-        message: 'A verification link has been sent to your email address by Firebase.',
-        email: normalizedEmail,
-        verificationLink: process.env.NODE_ENV !== 'production' ? verificationLink : undefined,
-      });
-    }
-
-    // Customer Email OTP Resend
+    // Resend 6-Digit Email Verification OTP via Resend
     const resendCheck = canResend(user);
     if (!resendCheck.canResend) {
       return res.status(429).json({
@@ -2959,7 +2821,11 @@ app.post(['/api/auth/resend-verification-email', '/api/auth/resend-verification-
 
     const plainOtp = await createOtpForUser(user, 'email_verification');
     try {
-      await resendService.sendCustomerRegistrationOtp({ to: normalizedEmail, otp: plainOtp });
+      if (user.role === 'worker') {
+        await resendService.sendWorkerRegistrationOtp({ to: normalizedEmail, otp: plainOtp });
+      } else {
+        await resendService.sendCustomerRegistrationOtp({ to: normalizedEmail, otp: plainOtp });
+      }
     } catch (emailErr) {
       console.warn('[Resend Verification OTP Email Warning]:', emailErr.message);
     }
@@ -2984,15 +2850,15 @@ app.post(['/api/auth/resend-verification-email', '/api/auth/resend-verification-
 app.post('/api/auth/send-registration-otp', authRateLimiter, async (req, res) => {
   return res.status(200).json({
     success: true,
-    message: 'HomeStepIn uses Firebase Email Verification. No SMS/phone OTP is required.',
+    message: 'HomeStepIn uses Resend Email Verification OTP.',
     requiresOtp: false,
   });
 });
 
-// Customer Public Registration (Firebase Email/Password Authentication)
+// Customer Public Registration
 app.post(['/api/auth/register-customer', '/api/auth/register'], authRateLimiter, async (req, res) => {
   try {
-    const { name, email, phone, password, confirmPassword, address, firebaseIdToken } = req.body;
+    const { name, email, phone, password, confirmPassword, address } = req.body;
 
     // 1. Full Name Validation
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
@@ -3019,12 +2885,46 @@ app.post(['/api/auth/register-customer', '/api/auth/register'], authRateLimiter,
       }
     }
 
-    // 4. Server-Side Duplicate Email Check
-    const existingEmail = await User.findOne({ email: normalizedEmail });
+    // 4. Server-Side Duplicate Email & Phone Validation (Parallel Execution)
+    const [existingEmail, existingPhone] = await Promise.all([
+      User.findOne({ email: normalizedEmail }).select('_id email role status').lean(),
+      normalizedPhone ? User.findOne({ phone: normalizedPhone }).select('_id phone role status').lean() : null,
+    ]);
+
     if (existingEmail) {
+      if (existingEmail.status === 'disabled' || existingEmail.status === 'suspended') {
+        return res.status(403).json({
+          error: 'This account has been deactivated. Please contact HomeStepIn support.',
+          code: 'ACCOUNT_DISABLED',
+          field: 'email',
+        });
+      }
+      if (existingEmail.role === 'worker') {
+        return res.status(409).json({
+          error: 'This email is already registered as a HomeStepIn Partner. Please sign in using the Partner App or use a different email.',
+          code: 'ROLE_CONFLICT',
+          field: 'email',
+        });
+      }
       return res.status(409).json({
-        error: 'An account with this email already exists. Please sign in or recover your account.',
+        error: 'An account with this email already exists. Please sign in or recover your password.',
         code: 'DUPLICATE_EMAIL',
+        field: 'email',
+      });
+    }
+
+    if (existingPhone) {
+      if (existingPhone.status === 'disabled' || existingPhone.status === 'suspended') {
+        return res.status(403).json({
+          error: 'This phone number is associated with a deactivated account. Please contact support.',
+          code: 'ACCOUNT_DISABLED',
+          field: 'phone',
+        });
+      }
+      return res.status(409).json({
+        error: 'An account with this phone number already exists. Please sign in or use a different phone number.',
+        code: 'DUPLICATE_PHONE',
+        field: 'phone',
       });
     }
 
@@ -3063,22 +2963,11 @@ app.post(['/api/auth/register-customer', '/api/auth/register'], authRateLimiter,
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    let fbUid = null;
-    try {
-      const fbUser = await syncFirebaseUser({
-        email: normalizedEmail,
-        password,
-        displayName: name.trim(),
-        emailVerified: false,
-      });
-      fbUid = fbUser.uid;
-    } catch (fbErr) {
-      console.warn('[Firebase Registration Warning]:', fbErr.message);
-    }
-
     const customId = `usr_cust_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
+    const username = customId.toLowerCase();
     const newUser = await User.create({
       customId,
+      username,
       name: name.trim(),
       email: normalizedEmail,
       phone: normalizedPhone || undefined,
@@ -3086,8 +2975,7 @@ app.post(['/api/auth/register-customer', '/api/auth/register'], authRateLimiter,
       role: 'customer',
       status: 'active',
       emailVerified: false,
-      firebaseUid: fbUid,
-      authProvider: 'firebase',
+      authProvider: 'local',
       address: address ? address.trim() : null,
       addresses: address
         ? [
@@ -3121,8 +3009,10 @@ app.post(['/api/auth/register-customer', '/api/auth/register'], authRateLimiter,
       expiresInSeconds: 300,
       resendCooldownSeconds: 60,
       user: {
-        id: newUser.customId,
+        id: newUser.customId || newUser._id.toString(),
         _id: newUser._id.toString(),
+        customId: newUser.customId || newUser._id.toString(),
+        username: newUser.username || '',
         name: newUser.name,
         email: newUser.email,
         phone: newUser.phone,
@@ -3134,15 +3024,63 @@ app.post(['/api/auth/register-customer', '/api/auth/register'], authRateLimiter,
     });
   } catch (dbErr) {
     if (dbErr.code === 11000 || (dbErr.message && dbErr.message.includes('E11000'))) {
+      const keyPattern = dbErr.keyPattern || {};
+      const msg = dbErr.message || '';
+      const indexMatch = msg.match(/index:\s+([a-zA-Z0-9_]+)/);
+      const indexName = indexMatch ? indexMatch[1] : '';
+
+      if (keyPattern.email || indexName.startsWith('email') || /index:\s*email/i.test(msg)) {
+        return res.status(409).json({
+          success: false,
+          error: 'An account with this email already exists. Please sign in or recover your account.',
+          message: 'An account with this email already exists. Please sign in or recover your account.',
+          code: 'DUPLICATE_EMAIL',
+          field: 'email',
+        });
+      }
+      if (keyPattern.phone || indexName.startsWith('phone') || /index:\s*phone/i.test(msg)) {
+        return res.status(409).json({
+          success: false,
+          error: 'An account with this phone number already exists. Please sign in or use a different phone number.',
+          message: 'An account with this phone number already exists. Please sign in or use a different phone number.',
+          code: 'DUPLICATE_PHONE',
+          field: 'phone',
+        });
+      }
+      if (keyPattern.username || indexName.startsWith('username') || /index:\s*username/i.test(msg)) {
+        return res.status(409).json({
+          success: false,
+          error: 'An account with this username already exists.',
+          message: 'An account with this username already exists.',
+          code: 'DUPLICATE_USERNAME',
+          field: 'username',
+        });
+      }
+      if (keyPattern.employeeId || indexName.startsWith('employeeId') || /index:\s*employeeId/i.test(msg)) {
+        return res.status(409).json({
+          success: false,
+          error: 'A technician or partner with this Employee ID is already registered.',
+          message: 'A technician or partner with this Employee ID is already registered.',
+          code: 'DUPLICATE_EMPLOYEE_ID',
+          field: 'employeeId',
+        });
+      }
+      const collidedField = Object.keys(keyPattern)[0] || 'credentials';
       return res.status(409).json({
-        error: 'An account with this email already exists. Please sign in or recover your account.',
-        code: 'DUPLICATE_EMAIL',
+        success: false,
+        error: `An account with this ${collidedField} already exists.`,
+        message: `An account with this ${collidedField} already exists.`,
+        code: 'DUPLICATE_ACCOUNT',
+        field: collidedField,
       });
     }
     console.error('[Customer Registration Error]:', dbErr.message || dbErr);
     return res.status(dbErr.status || 500).json({
+      success: false,
       error: dbErr.message || 'Unable to complete registration. Please try again.',
+      message: dbErr.message || 'Unable to complete registration. Please try again.',
       code: dbErr.code || 'REGISTRATION_ERROR',
+      field: null,
     });
   }
 });
@@ -3190,15 +3128,6 @@ app.post('/api/auth/verify-customer-otp', authRateLimiter, async (req, res) => {
     user.lastLoginAt = new Date();
     await user.save();
 
-    // Sync Firebase email_verified = true (non-blocking)
-    if (user.firebaseUid) {
-      try {
-        await setFirebaseUserEmailVerified(user.firebaseUid, true);
-      } catch (fbErr) {
-        console.warn('[Firebase Sync Warning]:', fbErr.message);
-      }
-    }
-
     const token = generateToken(user);
     return res.status(200).json({
       success: true,
@@ -3207,6 +3136,8 @@ app.post('/api/auth/verify-customer-otp', authRateLimiter, async (req, res) => {
       user: {
         id: user.customId || user._id.toString(),
         _id: user._id.toString(),
+        customId: user.customId || user._id.toString(),
+        username: user.username || '',
         name: user.name,
         email: user.email,
         phone: user.phone,
@@ -3426,29 +3357,8 @@ app.post(['/api/auth/worker/verify-reset-otp', '/api/auth/worker/reset-password'
 // Verify Password Reset OTP and set new password
 app.post(['/api/auth/verify-reset-otp', '/api/auth/reset-password'], authRateLimiter, async (req, res) => {
   try {
-    const { email, identifier, otp, newPassword, confirmPassword, firebaseIdToken } = req.body;
+    const { email, identifier, otp, newPassword, confirmPassword } = req.body;
     const targetEmail = email || identifier;
-
-    // Direct Firebase ID Token fallback if provided
-    if (firebaseIdToken && newPassword) {
-      try {
-        const fbResult = await verifyFirebaseEmailToken(firebaseIdToken, targetEmail);
-        const user = await User.findOne({ email: fbResult.email }).select('+passwordHash +refreshTokens');
-        if (!user) {
-          return res.status(404).json({ error: 'User account not found.', code: 'USER_NOT_FOUND' });
-        }
-        if (confirmPassword !== undefined && newPassword !== confirmPassword) {
-          return res.status(400).json({ error: 'Passwords do not match.' });
-        }
-        user.passwordHash = await bcrypt.hash(String(newPassword), 12);
-        user.refreshTokens = [];
-        user.mustChangePassword = false;
-        await user.save();
-        return res.json({ success: true, message: 'Password updated successfully. You can now sign in with your new password.' });
-      } catch (err) {
-        return res.status(400).json({ error: err.message || 'Failed to update password.' });
-      }
-    }
 
     // OTP-based Password Reset
     if (!targetEmail || !otp || !newPassword) {
@@ -3575,6 +3485,9 @@ app.get('/api/auth/me', authRequired, async (req, res) => {
   return res.json({
     user: {
       id: user.customId || user._id.toString(),
+      _id: user._id.toString(),
+      customId: user.customId || user._id.toString(),
+      username: user.username || user.employeeId || '',
       name: user.name,
       email: user.email,
       phone: user.phone,
@@ -4941,7 +4854,13 @@ app.patch('/api/admin/banners/:id/toggle', authRequired, requireRoles('admin'), 
     catalogCache.banners = null;
     catalogCache.bannersExp = 0;
 
-    return res.json({ success: true, is_active: newStatus, active: newStatus });
+    const updatedResult = bannerDoc ? bannerDoc.toObject() : (inMemoryBanners[memIdx] || {});
+    return res.json({
+      success: true,
+      is_active: newStatus,
+      active: newStatus,
+      banner: formatBannerResponse(updatedResult),
+    });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to toggle banner status: ' + err.message });
   }
@@ -9557,36 +9476,57 @@ app.get('/api/webrtc/ice-servers', authRequired, (req, res) => {
 
 // ── 6. NOTIFICATIONS DOMAIN ───────────────────────────────────────────
 
-// Register Device FCM Token (Multi-Device Safe & JWT-Authenticated)
-async function handleRegisterFcmToken(req, res) {
-  const { token, deviceId, platform } = req.body;
-  if (!token) return res.status(400).json({ error: 'FCM token string is required.' });
+// Register Device Push / OneSignal Subscription Token (Multi-Device Safe & JWT-Authenticated)
+async function handleRegisterPushToken(req, res) {
+  const token = req.body.token || req.body.subscriptionId || req.body.playerId || req.body.pushToken;
+  const { deviceId, platform } = req.body;
+  if (!token) return res.status(400).json({ error: 'Push subscription token string is required.' });
 
   const user = await findUserByIdOrIdentifier(req.auth.sub);
   if (!user) return res.status(404).json({ error: 'User not found.' });
 
-  if (!user.fcmTokens) user.fcmTokens = [];
+  const cleanToken = String(token).trim();
+  const cleanPlatform = ['android', 'ios', 'web'].includes(platform) ? platform : 'android';
+  const cleanDeviceId = deviceId || `dev_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
 
-  // Update existing device entry or append new device token
-  const existingIdx = user.fcmTokens.findIndex(
-    t => t.token === token || (deviceId && t.deviceId === deviceId)
+  // 1. Update pushSubscriptions (OneSignal)
+  if (!user.pushSubscriptions) user.pushSubscriptions = [];
+  const existingSubIdx = user.pushSubscriptions.findIndex(
+    s => s.subscriptionId === cleanToken || (deviceId && s.deviceId === deviceId)
   );
-
-  if (existingIdx !== -1) {
-    user.fcmTokens[existingIdx].token = token;
-    if (deviceId) user.fcmTokens[existingIdx].deviceId = deviceId;
-    if (platform) user.fcmTokens[existingIdx].platform = platform;
-    user.fcmTokens[existingIdx].lastSeenAt = new Date();
+  if (existingSubIdx !== -1) {
+    user.pushSubscriptions[existingSubIdx].subscriptionId = cleanToken;
+    if (deviceId) user.pushSubscriptions[existingSubIdx].deviceId = cleanDeviceId;
+    user.pushSubscriptions[existingSubIdx].platform = cleanPlatform;
+    user.pushSubscriptions[existingSubIdx].lastSeenAt = new Date();
   } else {
-    user.fcmTokens.push({
-      token,
-      deviceId: deviceId || `dev_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`,
-      platform: platform || 'android',
+    user.pushSubscriptions.push({
+      subscriptionId: cleanToken,
+      deviceId: cleanDeviceId,
+      platform: cleanPlatform,
       lastSeenAt: new Date(),
     });
   }
+  if (user.pushSubscriptions.length > 10) {
+    user.pushSubscriptions = user.pushSubscriptions.slice(-10);
+  }
 
-  // Deduplicate and retain only valid tokens (max 10 devices per user)
+  // 2. Backward compatibility mirror in fcmTokens
+  if (!user.fcmTokens) user.fcmTokens = [];
+  const existingFcmIdx = user.fcmTokens.findIndex(
+    t => t.token === cleanToken || (deviceId && t.deviceId === deviceId)
+  );
+  if (existingFcmIdx !== -1) {
+    user.fcmTokens[existingFcmIdx].token = cleanToken;
+    user.fcmTokens[existingFcmIdx].lastSeenAt = new Date();
+  } else {
+    user.fcmTokens.push({
+      token: cleanToken,
+      deviceId: cleanDeviceId,
+      platform: cleanPlatform,
+      lastSeenAt: new Date(),
+    });
+  }
   if (user.fcmTokens.length > 10) {
     user.fcmTokens = user.fcmTokens.slice(-10);
   }
@@ -9595,38 +9535,45 @@ async function handleRegisterFcmToken(req, res) {
 
   return res.json({
     success: true,
-    message: 'FCM token registered successfully.',
-    devicesCount: user.fcmTokens.length,
+    message: 'Push subscription token registered successfully.',
+    devicesCount: user.pushSubscriptions.length,
   });
 }
 
-app.post('/api/notifications/fcm-token', authRequired, handleRegisterFcmToken);
-app.post('/api/auth/fcm-token', authRequired, handleRegisterFcmToken);
-app.post('/api/notifications/register-device', authRequired, (req, res) => {
-  req.body.token = req.body.token || req.body.pushToken;
-  return handleRegisterFcmToken(req, res);
-});
+app.post('/api/notifications/push-token', authRequired, handleRegisterPushToken);
+app.post('/api/notifications/register-token', authRequired, handleRegisterPushToken);
+app.post('/api/notifications/register-device', authRequired, handleRegisterPushToken);
+app.post('/api/notifications/fcm-token', authRequired, handleRegisterPushToken);
+app.post('/api/auth/fcm-token', authRequired, handleRegisterPushToken);
 
-// Deregister Device FCM Token (Logout & Account Switching Safety)
-async function handleDeregisterFcmToken(req, res) {
-  const token = req.body.token || req.body.pushToken || req.query.token;
+// Deregister Device Push Token (Logout & Account Switching Safety)
+async function handleDeregisterPushToken(req, res) {
+  const token = req.body.token || req.body.subscriptionId || req.body.pushToken || req.query.token;
   const deviceId = req.body.deviceId || req.query.deviceId;
 
   const user = await findUserByIdOrIdentifier(req.auth.sub);
-  if (user && user.fcmTokens) {
-    user.fcmTokens = user.fcmTokens.filter(
-      t => (token ? t.token !== token : true) && (deviceId ? t.deviceId !== deviceId : true)
-    );
+  if (user) {
+    if (user.pushSubscriptions) {
+      user.pushSubscriptions = user.pushSubscriptions.filter(
+        s => (token ? s.subscriptionId !== String(token).trim() : true) && (deviceId ? s.deviceId !== deviceId : true)
+      );
+    }
+    if (user.fcmTokens) {
+      user.fcmTokens = user.fcmTokens.filter(
+        t => (token ? t.token !== String(token).trim() : true) && (deviceId ? t.deviceId !== deviceId : true)
+      );
+    }
     await user.save();
   }
 
-  return res.json({ success: true, message: 'FCM device token removed.' });
+  return res.json({ success: true, message: 'Push subscription device removed.' });
 }
 
-app.delete('/api/notifications/fcm-token', authRequired, handleDeregisterFcmToken);
-app.post('/api/notifications/fcm-token/deregister', authRequired, handleDeregisterFcmToken);
-app.delete('/api/auth/fcm-token', authRequired, handleDeregisterFcmToken);
-app.post('/api/notifications/unregister-device', authRequired, handleDeregisterFcmToken);
+app.delete('/api/notifications/push-token', authRequired, handleDeregisterPushToken);
+app.delete('/api/notifications/fcm-token', authRequired, handleDeregisterPushToken);
+app.post('/api/notifications/fcm-token/deregister', authRequired, handleDeregisterPushToken);
+app.delete('/api/auth/fcm-token', authRequired, handleDeregisterPushToken);
+app.post('/api/notifications/unregister-device', authRequired, handleDeregisterPushToken);
 
 // Get User Notifications (Paginated, Filterable & Strict User Scoped)
 app.get('/api/notifications', authRequired, async (req, res) => {
@@ -9775,136 +9722,125 @@ app.get('/api/complaints', authRequired, async (req, res) => {
 
 // ── 7. ADMIN OPERATIONS CONTROL CENTER DOMAIN ────────────────────────
 
+// Canonical Case-Insensitive Status Variant Arrays for Resilient Aggregations
+const CANONICAL_ACTIVE_STATUS_VARIANTS = [
+  'PENDING', 'pending', 'Pending',
+  'CONFIRMED', 'confirmed', 'Confirmed',
+  'WORKER_ASSIGNED', 'worker_assigned', 'Worker_Assigned', 'ASSIGNED', 'assigned',
+  'WORKER_ACCEPTED', 'worker_accepted', 'Worker_Accepted', 'ACCEPTED', 'accepted', 'Accepted',
+  'TRAVELLING', 'travelling', 'Travelling', 'ON_THE_WAY', 'on_the_way', 'Worker on the way',
+  'ARRIVED', 'arrived', 'Arrived',
+  'ENTERED_HOME', 'entered_home', 'enteredhome', 'EnteredHome',
+  'WORK_STARTED', 'work_started', 'Work started', 'INPROGRESS', 'inprogress', 'in_progress', 'InProgress',
+  'SEARCHING_WORKER', 'searching_worker', 'REQUESTED', 'requested', 'Requested', 'Created', 'created',
+];
+
+const CANONICAL_PENDING_STATUS_VARIANTS = [
+  'PENDING', 'pending', 'Pending',
+  'CONFIRMED', 'confirmed', 'Confirmed',
+  'REQUESTED', 'requested', 'Requested',
+  'SEARCHING_WORKER', 'searching_worker',
+  'CREATED', 'created', 'Created',
+  'OPEN', 'open', 'Open',
+];
+
+const CANONICAL_ASSIGNED_STATUS_VARIANTS = [
+  'WORKER_ASSIGNED', 'worker_assigned', 'ASSIGNED', 'assigned',
+  'WORKER_ACCEPTED', 'worker_accepted', 'Worker_Accepted', 'ACCEPTED', 'accepted', 'Accepted',
+  'TRAVELLING', 'travelling', 'Travelling', 'ON_THE_WAY', 'on_the_way', 'Worker on the way',
+  'ARRIVED', 'arrived', 'Arrived',
+  'ENTERED_HOME', 'entered_home', 'enteredhome', 'EnteredHome',
+  'WORK_STARTED', 'work_started', 'Work started', 'INPROGRESS', 'inprogress', 'in_progress', 'InProgress',
+];
+
+const CANONICAL_COMPLETED_STATUS_VARIANTS = [
+  'COMPLETED', 'completed', 'Completed',
+  'WORK_FINISHED', 'work_finished', 'Work finished', 'Finished', 'finished',
+  'CUSTOMER_CONFIRMED', 'customer_confirmed',
+  'PAYMENT_COMPLETED', 'payment_completed', 'PAYMENT_SETTLED', 'payment_settled', 'Settled', 'settled',
+  'RESOLVED', 'resolved',
+];
+
+const CANONICAL_CANCELLED_STATUS_VARIANTS = [
+  'CANCELLED', 'cancelled', 'Cancelled',
+  'DECLINED', 'declined', 'Declined',
+  'EXPIRED', 'expired', 'Expired',
+  'REJECTED', 'rejected', 'Rejected',
+];
+
 // 1. Comprehensive Admin Dashboard Metrics
 async function handleGetAdminMetrics(req, res) {
   const now = new Date();
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-  const totalBookings = await Booking.countDocuments();
-  const todayBookings = await Booking.countDocuments({ createdAt: { $gte: startOfToday } });
-  const activeBookings = await Booking.countDocuments({
-    status: {
-      $in: [
-        BOOKING_STATES.PENDING,
-        BOOKING_STATES.CONFIRMED,
-        BOOKING_STATES.WORKER_ASSIGNED,
-        BOOKING_STATES.WORKER_ACCEPTED,
-        BOOKING_STATES.TRAVELLING,
-        BOOKING_STATES.ARRIVED,
-        BOOKING_STATES.ENTERED_HOME,
-        BOOKING_STATES.WORK_STARTED,
-        'Accepted',
-        'Travelling',
-        'Worker on the way',
-        'Arrived',
-        'EnteredHome',
-        'Work started',
-        'InProgress',
-        'Pending',
-        'Requested',
-        'CONFIRMED',
-        'SEARCHING_WORKER',
+  // Execute all independent metric queries concurrently via Promise.all to prevent sequential DB round-trip latency
+  const [
+    totalBookings,
+    todayBookings,
+    activeBookings,
+    completedBookings,
+    cancelledBookings,
+    pendingBookings,
+    assignedBookings,
+    pendingPayments,
+    totalCustomers,
+    activeCustomers,
+    totalWorkers,
+    onlineWorkers,
+    pendingKyc,
+    totalComplaints,
+    openComplaints,
+    payments,
+    completedBookingsList,
+    allWorkers,
+  ] = await Promise.all([
+    Booking.countDocuments(),
+    Booking.countDocuments({ createdAt: { $gte: startOfToday } }),
+    Booking.countDocuments({ status: { $in: CANONICAL_ACTIVE_STATUS_VARIANTS } }),
+    Booking.countDocuments({ status: { $in: CANONICAL_COMPLETED_STATUS_VARIANTS } }),
+    Booking.countDocuments({ status: { $in: CANONICAL_CANCELLED_STATUS_VARIANTS } }),
+    Booking.countDocuments({ status: { $in: CANONICAL_PENDING_STATUS_VARIANTS } }),
+    Booking.countDocuments({ status: { $in: CANONICAL_ASSIGNED_STATUS_VARIANTS } }),
+    Booking.countDocuments({
+      status: { $nin: CANONICAL_COMPLETED_STATUS_VARIANTS.concat(CANONICAL_CANCELLED_STATUS_VARIANTS) },
+      paymentStatus: { $regex: /pending|cash/i },
+    }),
+    User.countDocuments({ role: 'customer' }),
+    User.countDocuments({ role: 'customer', status: 'active' }),
+    User.countDocuments({ role: { $in: CANONICAL_WORKER_ROLES } }),
+    User.countDocuments({ role: { $in: CANONICAL_WORKER_ROLES }, online: true }),
+    User.countDocuments({ role: { $in: CANONICAL_WORKER_ROLES }, kycStatus: { $in: ['pending', 'needs_review', 'Pending'] } }),
+    Complaint.countDocuments(),
+    Complaint.countDocuments({ status: { $in: ['Open', 'In Review', 'Under Review'] } }),
+    Payment.find({ status: { $in: ['PAID', 'SUCCESS', 'Captured', 'COMPLETED'] } }).select('bookingId amount createdAt').lean(),
+    Booking.find({
+      $or: [
+        {
+          status: {
+            $in: [
+              BOOKING_STATES.COMPLETED,
+              BOOKING_STATES.WORK_FINISHED,
+              BOOKING_STATES.CUSTOMER_CONFIRMED,
+              BOOKING_STATES.PAYMENT_COMPLETED,
+              'Completed',
+              'COMPLETED',
+              'PAYMENT_SETTLED',
+              'Finished',
+              'Settled',
+            ],
+          },
+        },
+        { paymentStatus: { $in: ['PAID', 'Settled', 'Paid', 'PAID ONLINE', 'Cash on Service', 'SUCCESS'] } },
       ],
-    },
-  });
-  const completedBookings = await Booking.countDocuments({
-    status: {
-      $in: [
-        BOOKING_STATES.COMPLETED,
-        BOOKING_STATES.WORK_FINISHED,
-        BOOKING_STATES.CUSTOMER_CONFIRMED,
-        BOOKING_STATES.PAYMENT_COMPLETED,
-        'Completed',
-        'COMPLETED',
-        'PAYMENT_SETTLED',
-        'Finished',
-        'Settled',
-      ],
-    },
-  });
-  const cancelledBookings = await Booking.countDocuments({
-    status: {
-      $in: [
-        BOOKING_STATES.CANCELLED,
-        BOOKING_STATES.DECLINED,
-        BOOKING_STATES.EXPIRED,
-        'CANCELLED',
-        'Cancelled',
-        'Declined',
-      ],
-    },
-  });
-
-  const pendingBookings = await Booking.countDocuments({
-    status: {
-      $in: [
-        BOOKING_STATES.PENDING,
-        BOOKING_STATES.CONFIRMED,
-        'Pending',
-        'Requested',
-        'CONFIRMED',
-        'SEARCHING_WORKER',
-        'Created',
-      ],
-    },
-  });
-
-  const assignedBookings = await Booking.countDocuments({
-    status: {
-      $in: [
-        BOOKING_STATES.WORKER_ASSIGNED,
-        BOOKING_STATES.WORKER_ACCEPTED,
-        BOOKING_STATES.TRAVELLING,
-        BOOKING_STATES.ARRIVED,
-        BOOKING_STATES.ENTERED_HOME,
-        BOOKING_STATES.WORK_STARTED,
-        'Accepted',
-        'Travelling',
-        'Worker on the way',
-        'Arrived',
-        'EnteredHome',
-        'Work started',
-        'InProgress',
-      ],
-    },
-  });
-
-  const totalCustomers = await User.countDocuments({ role: 'customer' });
-  const activeCustomers = await User.countDocuments({ role: 'customer', status: 'active' });
-
-  const totalWorkers = await User.countDocuments({ role: 'worker' });
-  const onlineWorkers = await User.countDocuments({ role: 'worker', online: true });
-  const pendingKyc = await User.countDocuments({ role: 'worker', kycStatus: { $in: ['pending', 'needs_review', 'Pending'] } });
-
-  const totalComplaints = await Complaint.countDocuments();
-  const openComplaints = await Complaint.countDocuments({ status: { $in: ['Open', 'In Review', 'Under Review'] } });
+    }).select('customId id _id price priceNum paymentStatus createdAt').lean(),
+    User.find({ role: { $in: CANONICAL_WORKER_ROLES } })
+      .select('customId _id name email phone employeeId services online ratingAvg ratingCount status')
+      .lean(),
+  ]);
 
   // Calculate Real Financials from persistent Payment & Booking records
-  const payments = await Payment.find({ status: { $in: ['PAID', 'SUCCESS', 'Captured', 'COMPLETED'] } }).lean();
   const paymentRevenue = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
-
-  // Also include completed/settled bookings that don't have duplicate payment records
   const paidBookingIds = new Set(payments.map(p => String(p.bookingId)));
-  const completedBookingsList = await Booking.find({
-    $or: [
-      {
-        status: {
-          $in: [
-            BOOKING_STATES.COMPLETED,
-            BOOKING_STATES.WORK_FINISHED,
-            BOOKING_STATES.CUSTOMER_CONFIRMED,
-            BOOKING_STATES.PAYMENT_COMPLETED,
-            'Completed',
-            'COMPLETED',
-            'PAYMENT_SETTLED',
-            'Finished',
-            'Settled',
-          ],
-        },
-      },
-      { paymentStatus: { $in: ['PAID', 'Settled', 'Paid', 'PAID ONLINE', 'Cash on Service', 'SUCCESS'] } },
-    ],
-  }).lean();
 
   const bookingRevenue = completedBookingsList.reduce((sum, b) => {
     const bId = String(b.customId || b.id || b._id);
@@ -9925,25 +9861,6 @@ async function handleGetAdminMetrics(req, res) {
       const amt = Number(b.priceNum) || (typeof b.price === 'string' ? parseFloat(b.price.replace(/[^0-9.]/g, '')) : 0) || 0;
       return sum + amt;
     }, 0) + payments.filter(p => p.createdAt && new Date(p.createdAt) >= startOfToday).reduce((s, p) => s + (p.amount || 0), 0);
-
-  const pendingPayments = await Booking.countDocuments({
-    status: {
-      $nin: [
-        BOOKING_STATES.COMPLETED,
-        BOOKING_STATES.WORK_FINISHED,
-        BOOKING_STATES.CUSTOMER_CONFIRMED,
-        BOOKING_STATES.PAYMENT_COMPLETED,
-        BOOKING_STATES.CANCELLED,
-        'Completed',
-        'COMPLETED',
-        'CANCELLED',
-        'Cancelled',
-      ],
-    },
-    paymentStatus: { $regex: /pending|cash/i },
-  });
-
-  const allWorkers = await User.find({ role: 'worker' }).lean();
 
   return res.json({
     stats: {
@@ -9992,36 +9909,21 @@ async function handleGetAdminMetrics(req, res) {
 app.get('/api/admin/metrics', authRequired, requireRoles('admin'), handleGetAdminMetrics);
 app.get('/api/admin/dashboard', authRequired, requireRoles('admin'), handleGetAdminMetrics);
 
-// 2. Live Operations Monitor
+// 2. Live Operations Monitor (Parallelized Booking & Worker Queries)
 app.get('/api/admin/live-ops', authRequired, requireRoles('admin'), async (req, res) => {
-  const activeBookings = await Booking.find({
-    status: {
-      $in: [
-        BOOKING_STATES.PENDING,
-        BOOKING_STATES.CONFIRMED,
-        BOOKING_STATES.WORKER_ASSIGNED,
-        BOOKING_STATES.WORKER_ACCEPTED,
-        BOOKING_STATES.TRAVELLING,
-        BOOKING_STATES.ARRIVED,
-        BOOKING_STATES.ENTERED_HOME,
-        BOOKING_STATES.WORK_STARTED,
-        'Accepted',
-        'Travelling',
-        'Worker on the way',
-        'Arrived',
-        'EnteredHome',
-        'Work started',
-        'InProgress',
-        'Requested',
-        'Pending',
-        'SEARCHING_WORKER',
-      ],
-    },
-  })
-    .sort({ createdAt: -1 })
-    .lean();
+  const [activeBookings, allWorkers] = await Promise.all([
+    Booking.find({
+      status: {
+        $in: CANONICAL_ACTIVE_STATUS_VARIANTS,
+      },
+    })
+      .sort({ createdAt: -1 })
+      .lean(),
+    User.find({ role: { $in: CANONICAL_WORKER_ROLES } })
+      .select('customId _id name phone employeeId services serviceArea ratingAvg status online')
+      .lean(),
+  ]);
 
-  const allWorkers = await User.find({ role: 'worker' }).lean();
   const onlineWorkers = allWorkers.filter(w => w.online);
 
   const travellingWorkers = activeBookings.filter(b => {
@@ -10079,7 +9981,7 @@ app.get('/api/admin/live-ops', authRequired, requireRoles('admin'), async (req, 
 // 3. Worker Management & KYC Lifecycle
 app.get('/api/admin/workers', authRequired, requireRoles('admin'), async (req, res) => {
   const { status, kycStatus, service, search, page = 1, limit = 50 } = req.query;
-  let query = { role: 'worker' };
+  let query = { role: { $in: CANONICAL_WORKER_ROLES } };
 
   if (status && status !== 'all') {
     if (status === 'online') query.online = true;
@@ -10170,39 +10072,54 @@ app.post('/api/admin/workers', authRequired, requireRoles('admin'), async (req, 
   const normalizedPhone = phone ? normalizeIndianPhoneNumber(phone) : null;
   const normalizedEmpId = employeeId.trim().toUpperCase();
 
-  const existingEmail = await User.findOne({ email: normalizedEmail });
+  const customId = `usr_work_${Date.now()}`;
+  const rawUsername = (normalizedEmpId || customId).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  const usernameCandidate = rawUsername.length >= 3 ? rawUsername : `work_${rawUsername}_${Date.now().toString().slice(-4)}`;
+
+  // Parallelize duplicate credential queries and CPU-intensive bcrypt hashing concurrently
+  const [existingEmail, existingPhone, existingEmpId, existingUsername, passwordHash] = await Promise.all([
+    User.findOne({ email: normalizedEmail }).select('_id email').lean(),
+    normalizedPhone ? User.findOne({ phone: normalizedPhone }).select('_id phone').lean() : null,
+    User.findOne({ employeeId: normalizedEmpId }).select('_id employeeId').lean(),
+    User.findOne({ username: usernameCandidate }).select('_id username').lean(),
+    bcrypt.hash(password, 10),
+  ]);
+
   if (existingEmail) {
     return res.status(409).json({
       error: 'An account with this email already exists. Please sign in or recover your account.',
       code: 'DUPLICATE_EMAIL',
+      field: 'email',
     });
   }
 
-  if (normalizedPhone) {
-    const existingPhone = await User.findOne({ phone: normalizedPhone });
-    if (existingPhone) {
-      return res.status(409).json({
-        error: 'An account with this phone number already exists. Please sign in or recover your account.',
-        code: 'DUPLICATE_PHONE',
-      });
-    }
+  if (existingPhone) {
+    return res.status(409).json({
+      error: 'An account with this phone number already exists. Please sign in or recover your account.',
+      code: 'DUPLICATE_PHONE',
+      field: 'phone',
+    });
   }
 
-  const existingEmpId = await User.findOne({ employeeId: normalizedEmpId });
   if (existingEmpId) {
     return res.status(409).json({
       error: 'A technician or partner with this Employee ID is already registered.',
       code: 'DUPLICATE_EMPLOYEE_ID',
+      field: 'employeeId',
     });
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
-  const customId = `usr_work_${Date.now()}`;
+  // Automatic unique username generation without collision
+  let username = usernameCandidate;
+  if (existingUsername) {
+    username = `${rawUsername}_${Date.now().toString().slice(-4)}`;
+  }
 
   let worker;
   try {
     worker = await User.create({
       customId,
+      username,
       name: name.trim(),
       email: normalizedEmail,
       phone: normalizedPhone || `+919${Date.now().toString().slice(-9)}`,
@@ -10224,38 +10141,70 @@ app.post('/api/admin/workers', authRequired, requireRoles('admin'), async (req, 
     if (createErr.code === 11000 || (createErr.message && createErr.message.includes('E11000'))) {
       const keyPattern = createErr.keyPattern || {};
       const msg = createErr.message || '';
-      if (keyPattern.email || /email/i.test(msg)) {
+      const indexMatch = msg.match(/index:\s+([a-zA-Z0-9_]+)/);
+      const indexName = indexMatch ? indexMatch[1] : '';
+
+      if (keyPattern.email || indexName.startsWith('email') || /index:\s*email/i.test(msg)) {
         return res.status(409).json({
+          success: false,
           error: 'An account with this email already exists. Please sign in or recover your account.',
+          message: 'An account with this email already exists. Please sign in or recover your account.',
           code: 'DUPLICATE_EMAIL',
+          field: 'email',
         });
       }
-      if (keyPattern.phone || /phone/i.test(msg)) {
+      if (keyPattern.phone || indexName.startsWith('phone') || /index:\s*phone/i.test(msg)) {
         return res.status(409).json({
+          success: false,
           error: 'An account with this phone number already exists. Please sign in or recover your account.',
+          message: 'An account with this phone number already exists. Please sign in or recover your account.',
           code: 'DUPLICATE_PHONE',
+          field: 'phone',
         });
       }
-      if (keyPattern.employeeId || /employeeId/i.test(msg)) {
+      if (keyPattern.employeeId || indexName.startsWith('employeeId') || /index:\s*employeeId/i.test(msg)) {
         return res.status(409).json({
+          success: false,
           error: 'A technician or partner with this Employee ID is already registered.',
+          message: 'A technician or partner with this Employee ID is already registered.',
           code: 'DUPLICATE_EMPLOYEE_ID',
+          field: 'employeeId',
         });
       }
+      if (keyPattern.username || indexName.startsWith('username') || /index:\s*username/i.test(msg)) {
+        return res.status(409).json({
+          success: false,
+          error: 'A technician or partner with this Employee ID or username is already registered.',
+          message: 'A technician or partner with this Employee ID or username is already registered.',
+          code: 'DUPLICATE_USERNAME',
+          field: 'username',
+        });
+      }
+      const collidedField = Object.keys(keyPattern)[0] || 'credentials';
       return res.status(409).json({
-        error: 'A worker with these credentials already exists.',
+        success: false,
+        error: `A worker with this ${collidedField} already exists.`,
+        message: `A worker with this ${collidedField} already exists.`,
         code: 'DUPLICATE_ACCOUNT',
+        field: collidedField,
       });
     }
-    throw createErr;
+    console.error('[Admin Worker Provisioning Error]:', createErr);
+    return res.status(createErr.status || 500).json({
+      success: false,
+      error: createErr.message || 'Unable to provision partner. Please try again.',
+      message: createErr.message || 'Unable to provision partner. Please try again.',
+      code: createErr.code || 'WORKER_PROVISIONING_ERROR',
+      field: null,
+    });
   }
 
-  await logFinancialAudit('ADMIN_WORKER_PROVISIONED', worker.customId, req.auth.sub, 'admin', 0, {
+  logFinancialAudit('ADMIN_WORKER_PROVISIONED', worker.customId, req.auth.sub, 'admin', 0, {
     name: worker.name,
     email: worker.email,
     employeeId: worker.employeeId,
     services: worker.services,
-  });
+  }).catch(err => console.error('[AuditLog Error]', err));
 
   return res.status(201).json({
     success: true,
@@ -10263,6 +10212,7 @@ app.post('/api/admin/workers', authRequired, requireRoles('admin'), async (req, 
       id: worker._id.toString(),
       _id: worker._id.toString(),
       customId: worker.customId,
+      username: worker.username,
       name: worker.name,
       email: worker.email,
       phone: worker.phone,
@@ -10277,7 +10227,7 @@ app.post('/api/admin/workers', authRequired, requireRoles('admin'), async (req, 
 
 app.get('/api/admin/workers/:id', authRequired, requireRoles('admin'), async (req, res) => {
   const worker = await findUserByIdOrIdentifier(req.params.id);
-  if (!worker || worker.role !== 'worker') return res.status(404).json({ error: 'Worker not found.' });
+  if (!worker || !isWorkerRole(worker.role)) return res.status(404).json({ error: 'Worker not found.' });
 
   const workerQuery = buildWorkerBookingQuery(worker);
   const recentBookings = await Booking.find(workerQuery)
@@ -10331,7 +10281,7 @@ app.patch('/api/admin/workers/:id/kyc', authRequired, requireRoles('admin'), asy
   if (!status) return res.status(400).json({ error: 'KYC status is required (approved, rejected, needs_review).' });
 
   const worker = await findUserByIdOrIdentifier(req.params.id);
-  if (!worker || worker.role !== 'worker') return res.status(404).json({ error: 'Worker not found.' });
+  if (!worker || !isWorkerRole(worker.role)) return res.status(404).json({ error: 'Worker not found.' });
 
   const prevStatus = worker.kycStatus;
   worker.kycStatus = status;
@@ -10363,7 +10313,7 @@ async function handleAdminWorkerServicesUpdate(req, res) {
   const { services, serviceArea, serviceRadiusKm } = req.body;
   userLookupCache.clear();
   const worker = await findUserByIdOrIdentifier(req.params.id);
-  if (!worker || worker.role !== 'worker') return res.status(404).json({ error: 'Worker not found.' });
+  if (!worker || !isWorkerRole(worker.role)) return res.status(404).json({ error: 'Worker not found.' });
 
   if (Array.isArray(services)) {
     worker.services = services;
@@ -10394,7 +10344,7 @@ app.patch('/api/admin/workers/:id/services/approve', authRequired, requireRoles(
   const { servicesToApprove } = req.body;
   userLookupCache.clear();
   const worker = await findUserByIdOrIdentifier(req.params.id);
-  if (!worker || worker.role !== 'worker') return res.status(404).json({ error: 'Worker not found.' });
+  if (!worker || !isWorkerRole(worker.role)) return res.status(404).json({ error: 'Worker not found.' });
 
   const toApprove = Array.isArray(servicesToApprove) && servicesToApprove.length > 0
     ? servicesToApprove
@@ -10426,7 +10376,7 @@ app.patch('/api/admin/workers/:id/services/approve', authRequired, requireRoles(
 app.patch('/api/admin/workers/:id/status', authRequired, requireRoles('admin'), async (req, res) => {
   userLookupCache.clear();
   const user = await findUserByIdOrIdentifier(req.params.id);
-  if (!user || user.role !== 'worker') return res.status(404).json({ error: 'Worker not found.' });
+  if (!user || !isWorkerRole(user.role)) return res.status(404).json({ error: 'Worker not found.' });
 
   const prev = user.status;
   user.status = req.body.status || user.status;
@@ -10470,7 +10420,7 @@ function formatWorkerProfile(w) {
 // Full Worker Profile Editing from Admin
 async function handleAdminWorkerProfileUpdate(req, res) {
   const worker = await findUserByIdOrIdentifier(req.params.id);
-  if (!worker || worker.role !== 'worker') return res.status(404).json({ error: 'Worker not found.' });
+  if (!worker || !isWorkerRole(worker.role)) return res.status(404).json({ error: 'Worker not found.' });
 
   const {
     name,
@@ -10514,8 +10464,12 @@ app.put('/api/admin/workers/:id', authRequired, requireRoles('admin'), handleAdm
 
 // 4. Customer Directory
 app.get('/api/admin/customers', authRequired, requireRoles('admin'), async (req, res) => {
-  const { search, page = 1, limit = 50 } = req.query;
-  let query = { role: 'customer' };
+  const { search, status, page = 1, limit = 50 } = req.query;
+  let query = { role: { $in: ['customer', 'Customer', 'CUSTOMER'] } };
+
+  if (status && status !== 'all') {
+    query.status = status;
+  }
 
   if (search) {
     const q = String(search).trim();
@@ -10731,19 +10685,19 @@ app.get('/api/admin/bookings', authRequired, requireRoles('admin'), async (req, 
   if (status && status !== 'all') {
     const s = String(status).trim().toUpperCase();
     if (['PENDING', 'CREATED', 'REQUESTED', 'SEARCHING_WORKER', 'OPEN'].includes(s)) {
-      query.status = { $in: ['PENDING', 'CONFIRMED', 'CREATED', 'REQUESTED', 'SEARCHING_WORKER', 'OPEN'] };
+      query.status = { $in: CANONICAL_PENDING_STATUS_VARIANTS };
     } else if (['ACCEPTED', 'ASSIGNED', 'WORKER_ASSIGNED', 'WORKER_ACCEPTED'].includes(s)) {
-      query.status = { $in: ['WORKER_ASSIGNED', 'ASSIGNED', 'WORKER_ACCEPTED', 'ACCEPTED'] };
+      query.status = { $in: CANONICAL_ASSIGNED_STATUS_VARIANTS };
     } else if (['TRAVELLING', 'ON_THE_WAY', 'WORKER_ON_THE_WAY'].includes(s)) {
-      query.status = { $in: ['TRAVELLING', 'WORKER_ON_THE_WAY', 'ON_THE_WAY'] };
+      query.status = { $in: ['TRAVELLING', 'travelling', 'Travelling', 'WORKER_ON_THE_WAY', 'worker_on_the_way', 'ON_THE_WAY', 'on_the_way', 'Worker on the way'] };
     } else if (['ARRIVED', 'ENTERED_HOME', 'ENTEREDHOME'].includes(s)) {
-      query.status = { $in: ['ARRIVED', 'ENTERED_HOME', 'ENTEREDHOME'] };
+      query.status = { $in: ['ARRIVED', 'arrived', 'Arrived', 'ENTERED_HOME', 'entered_home', 'enteredhome', 'EnteredHome'] };
     } else if (['INPROGRESS', 'IN_PROGRESS', 'WORK_STARTED', 'STARTED'].includes(s)) {
-      query.status = { $in: ['WORK_STARTED', 'IN_PROGRESS', 'INPROGRESS', 'STARTED'] };
+      query.status = { $in: ['WORK_STARTED', 'work_started', 'Work started', 'IN_PROGRESS', 'in_progress', 'INPROGRESS', 'inprogress', 'STARTED', 'started'] };
     } else if (['COMPLETED', 'RESOLVED', 'PAYMENT_COMPLETED', 'PAYMENT_SETTLED'].includes(s)) {
-      query.status = { $in: ['WORK_FINISHED', 'CUSTOMER_CONFIRMED', 'PAYMENT_COMPLETED', 'PAYMENT_SETTLED', 'COMPLETED', 'RESOLVED', 'Completed'] };
+      query.status = { $in: CANONICAL_COMPLETED_STATUS_VARIANTS };
     } else if (['CANCELLED', 'REJECTED', 'DECLINED', 'EXPIRED'].includes(s)) {
-      query.status = { $in: ['CANCELLED', 'REJECTED', 'DECLINED', 'EXPIRED', 'Cancelled'] };
+      query.status = { $in: CANONICAL_CANCELLED_STATUS_VARIANTS };
     } else {
       query.status = new RegExp(`^${status}$`, 'i');
     }
@@ -12818,30 +12772,42 @@ app.get('/api/admin/notifications', authRequired, requireRoles('admin'), async (
 app.get('/api/admin/analytics', authRequired, requireRoles('admin'), async (req, res) => {
   const { range = '30d' } = req.query;
 
-  const totalBookings = await Booking.countDocuments();
-  const completedBookings = await Booking.countDocuments({ status: { $in: ['Completed', 'PAYMENT_SETTLED'] } });
-  const cancelledBookings = await Booking.countDocuments({ status: { $in: ['CANCELLED', 'Cancelled'] } });
+  // Execute all independent analytics queries concurrently to prevent sequential DB round-trip latency
+  const [
+    totalBookings,
+    completedBookings,
+    cancelledBookings,
+    payments,
+    assignedOffers,
+    uniqueCustomers,
+    repeatCustomersAgg,
+    services,
+  ] = await Promise.all([
+    Booking.countDocuments(),
+    Booking.countDocuments({ status: { $in: ['Completed', 'PAYMENT_SETTLED', 'COMPLETED'] } }),
+    Booking.countDocuments({ status: { $in: ['CANCELLED', 'Cancelled'] } }),
+    Payment.find({ status: { $in: ['PAID', 'SUCCESS', 'Captured'] } }).select('amount').lean(),
+    Booking.countDocuments({ providerId: { $ne: null } }),
+    Booking.distinct('customerId'),
+    Booking.aggregate([
+      { $group: { _id: '$customerId', count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+      { $count: 'repeatCount' },
+    ]),
+    Service.find({ active: true }).select('name category priceStart popular').lean(),
+  ]);
+
   const cancellationRate = totalBookings > 0 ? ((cancelledBookings / totalBookings) * 100).toFixed(1) + '%' : '0%';
   const completionRate = totalBookings > 0 ? ((completedBookings / totalBookings) * 100).toFixed(1) + '%' : '0%';
 
-  const payments = await Payment.find({ status: { $in: ['PAID', 'SUCCESS', 'Captured'] } }).lean();
   const totalGmv = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
   const totalPlatformFees = Math.round(totalGmv * 0.2);
   const totalWorkerPayouts = totalGmv - totalPlatformFees;
 
-  const assignedOffers = await Booking.countDocuments({ providerId: { $ne: null } });
   const workerAcceptanceRate = totalBookings > 0 ? ((assignedOffers / totalBookings) * 100).toFixed(1) + '%' : '0%';
   const onTimeArrivalRate = completedBookings > 0 ? '100.0%' : '0%';
-  const uniqueCustomers = await Booking.distinct('customerId');
-  const repeatCustomersAgg = await Booking.aggregate([
-    { $group: { _id: '$customerId', count: { $sum: 1 } } },
-    { $match: { count: { $gt: 1 } } },
-    { $count: 'repeatCount' },
-  ]);
   const repeatCount = (repeatCustomersAgg && repeatCustomersAgg[0] && repeatCustomersAgg[0].repeatCount) || 0;
   const customerRetention = uniqueCustomers.length > 0 ? ((repeatCount / uniqueCustomers.length) * 100).toFixed(1) + '%' : '0%';
-
-  const services = await Service.find({ active: true }).lean();
 
   return res.json({
     metrics: {
@@ -12883,7 +12849,7 @@ app.get('/api/admin/search', authRequired, requireRoles('admin'), async (req, re
       $or: [{ customId: regex }, { customerName: regex }, { service: regex }, { providerName: regex }],
     }).limit(6).lean(),
     User.find({
-      role: 'worker',
+      role: { $in: CANONICAL_WORKER_ROLES },
       $or: [{ name: regex }, { email: regex }, { phone: regex }, { employeeId: regex }],
     }).limit(6).lean(),
     User.find({
@@ -13618,7 +13584,7 @@ async function startServer() {
       { $set: { serviceArea: 'Cantonment, Thillai Nagar, Tiruchirappalli (Trichy)' } }
     ).catch(err => console.warn('[Worker ServiceArea Migration Warning]:', err.message));
     if (process.env.NODE_ENV !== 'production' || process.env.SEED_DATABASE === 'true') {
-      await seedDatabase().catch(err => console.warn('[DB Seed Warning]:', err.message));
+      await seedDatabase();
     }
     await backfillLegacyCompletedBookings().catch(err => console.warn('[Backfill Warning]:', err));
     await Booking.updateMany(
@@ -13650,7 +13616,7 @@ async function startServer() {
       console.log(`[HomeStepIn Backend API & WS] Running on http://0.0.0.0:${config.port} (WS on /ws)`);
     });
   } catch (err) {
-    console.error('[HomeStepIn Startup Error] Failed to start server:', err.stack || err);
+    console.error('[HomeStepIn Startup Error] Failed to start server:', err);
     process.exit(1);
   }
 }

@@ -66,12 +66,29 @@ async function run() {
   const { connectDb } = require('./src/db');
   await connectDb();
 
-  const adminToken = signAccess({ _id: '6ab183a5483c6abee9abe4d0', role: 'admin' });
-  const custToken = signAccess({ _id: '6ab183a5483c6abee9abe4d1', role: 'customer' });
+  const { app } = require('./server');
+  const server = app.listen(4001);
+  await new Promise(res => server.once('listening', res));
+
+  const User = require('./src/models/User');
+  let adminUser = await User.findOne({ role: 'admin', status: 'active' });
+  if (!adminUser) {
+    adminUser = await User.create({
+      customId: `test_admin_${Date.now()}`,
+      username: `test_admin_${Date.now()}`,
+      name: 'Test SuperAdmin',
+      email: `test_admin_${Date.now()}@homestepin.com`,
+      phone: `+9199${Math.floor(10000000 + Math.random() * 89999999)}`,
+      role: 'admin',
+      adminRole: 'SUPER_ADMIN',
+      status: 'active'
+    });
+  }
+  const adminToken = signAccess({ _id: adminUser._id, id: adminUser.customId || adminUser._id.toString(), role: 'admin' });
+  const custToken = signAccess({ _id: adminUser._id, id: adminUser.customId || adminUser._id.toString(), role: 'customer' });
   assert(Boolean(adminToken), 'Admin token minted successfully');
 
   // Load models for fixture setup
-  const User = require('./src/models/User');
   const Booking = require('./src/models/Booking');
   const NotificationOutbox = require('./src/models/NotificationOutbox');
 
@@ -81,10 +98,11 @@ async function run() {
   async function createTestWorker(data) {
     return await User.create({
       customId: `${prefix}_${data.id}`,
+      username: `${prefix}_${data.id}`.toLowerCase(),
       name: data.name,
       email: `${prefix}_${data.id}@test.com`,
       phone: `+9199${Math.floor(10000000 + Math.random() * 89999999)}`,
-      employeeId: `EMP-${data.id.toUpperCase()}`,
+      employeeId: `EMP-${prefix}-${data.id.toUpperCase()}`,
       passwordHash: 'dummy',
       role: 'worker',
       status: data.status || 'active',
@@ -185,7 +203,7 @@ async function run() {
   // -------------------------------------------------------------------------
   console.log('\n--- Scenario 1: AC Repair Booking Dropdown Qualification Check ---');
   const res1 = await request('GET', `/api/admin/bookings/${bookingAc.customId}/eligible-workers`, null, adminToken);
-  assert(res1.status === 200, 'GET eligible-workers returns 200 OK');
+  assert(res1.status === 200, 'GET eligible-workers returns 200 OK', JSON.stringify({ status: res1.status, data: res1.data }));
   const eligibleAcIds = res1.data.eligibleWorkers.map(w => w.id || w.customId);
   assert(eligibleAcIds.includes(techAc1.customId), 'Tech AC 1 appears for AC booking');
   assert(eligibleAcIds.includes(techAc2.customId), 'Tech AC 2 appears for AC booking');
@@ -397,6 +415,7 @@ async function run() {
   console.log('\n========================================================================');
   console.log('   ALL 12 SERVICE-BASED ASSIGNMENT TEST SCENARIOS PASSED WITH EVIDENCE!');
   console.log('========================================================================\n');
+  server.close();
   process.exit(0);
 }
 

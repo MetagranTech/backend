@@ -13,11 +13,11 @@ const userSchema = new mongoose.Schema(
     customId: { type: String, unique: true, sparse: true, index: true },
     name: { type: String, required: true, trim: true, maxlength: 80 },
     email: { type: String, lowercase: true, trim: true, unique: true, sparse: true },
-    username: { type: String, lowercase: true, trim: true, unique: true, sparse: true },
+    username: { type: String, lowercase: true, trim: true },
     phone: { type: String, trim: true, unique: true, sparse: true },
-    employeeId: { type: String, trim: true, uppercase: true, unique: true, sparse: true },
+    employeeId: { type: String, trim: true, uppercase: true },
     passwordHash: { type: String, required: true, select: false },
-    role: { type: String, enum: ['customer', 'worker', 'admin'], required: true, index: true },
+    role: { type: String, required: true, index: true },
     adminRole: {
       type: String,
       enum: ['SUPER_ADMIN', 'ADMIN', 'BASIC_ADMIN', 'Super Admin', 'Operations Admin'],
@@ -53,10 +53,10 @@ const userSchema = new mongoose.Schema(
       default: false,
       index: true,
     },
+    // Deprecated: legacy Firebase UID preserved as unindexed optional field for backward compatibility
     firebaseUid: {
       type: String,
-      sparse: true,
-      index: true,
+      default: null,
     },
     authProvider: {
       type: String,
@@ -117,6 +117,15 @@ const userSchema = new mongoose.Schema(
       resendCooldownExpires: Date,
       resendCount: { type: Number, default: 0 },
     },
+    // OneSignal & Device Push Notification Subscriptions
+    pushSubscriptions: [
+      {
+        subscriptionId: { type: String, required: true },
+        deviceId: { type: String },
+        platform: { type: String, enum: ['android', 'ios', 'web'], default: 'android' },
+        lastSeenAt: { type: Date, default: Date.now },
+      },
+    ],
     fcmTokens: [
       {
         token: { type: String, required: true },
@@ -140,5 +149,13 @@ const userSchema = new mongoose.Schema(
 
 userSchema.index({ role: 1, online: 1 });
 userSchema.index({ role: 1, status: 1, online: 1, services: 1 });
+userSchema.index(
+  { username: 1 },
+  { unique: true, partialFilterExpression: { username: { $type: 'string' } } }
+);
+userSchema.index(
+  { employeeId: 1 },
+  { unique: true, partialFilterExpression: { employeeId: { $type: 'string' } } }
+);
 
 module.exports = mongoose.model('User', userSchema);

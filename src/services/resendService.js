@@ -317,6 +317,13 @@ async function sendWorkerPasswordResetOtp({ to, otp }) {
   return sendResendOtpEmail({ to, otp, purpose: 'worker_password_reset' });
 }
 
+/**
+ * Dispatch Partner / Worker Registration Verification OTP via Resend.
+ */
+async function sendWorkerRegistrationOtp({ to, otp }) {
+  return sendResendOtpEmail({ to, otp, purpose: 'worker_registration' });
+}
+
 module.exports = {
   getResendClient,
   validateResendConfig,
@@ -324,6 +331,7 @@ module.exports = {
   buildWorkerOtpEmailHtml,
   sendResendOtpEmail,
   sendCustomerRegistrationOtp,
+  sendWorkerRegistrationOtp,
   sendCustomerPasswordResetOtp,
   sendWorkerPasswordResetOtp,
   setTestResendTransport,

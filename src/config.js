@@ -20,10 +20,32 @@ const FORBIDDEN_PROD_VALUES = new Set([
   'ChangeMe_Admin_1',
 ]);
 
+function sanitizeMongoUri(rawUri) {
+  if (!rawUri || typeof rawUri !== 'string') return '';
+  let uri = rawUri.trim().replace(/[\u200B-\u200D\uFEFF]/g, '');
+  uri = uri.replace(/^(MONGODB_URI|MONGO_URI|DATABASE_URL)\s*=\s*/i, '').trim();
+  while (
+    (uri.startsWith('"') && uri.endsWith('"')) ||
+    (uri.startsWith("'") && uri.endsWith("'")) ||
+    (uri.startsWith('“') && uri.endsWith('”')) ||
+    (uri.startsWith('‘') && uri.endsWith('’'))
+  ) {
+    uri = uri.slice(1, -1).trim();
+  }
+  return uri.replace(/^['"]+|['"]+$/g, '').trim();
+}
+
 function required(name, fallback, minLength = 0) {
-  const value = process.env[name] || (!isProduction ? fallback : undefined);
+  let value = process.env[name];
+  if (!value && name === 'MONGODB_URI') {
+    value = process.env.MONGO_URI;
+  }
+  value = value || (!isProduction ? fallback : undefined);
   if (!value) {
     throw new Error(`Missing required environment variable ${name}`);
+  }
+  if (typeof value === 'string' && (name === 'MONGODB_URI' || name === 'MONGO_URI')) {
+    value = sanitizeMongoUri(value);
   }
   if (isProduction) {
     if (FORBIDDEN_PROD_VALUES.has(value)) {
@@ -52,18 +74,45 @@ module.exports = {
   jwtRefreshTtl: process.env.JWT_REFRESH_TTL || '14d',
   paymentWebhookSecret: required('PAYMENT_WEBHOOK_SECRET', 'dev-payment-webhook-secret', 16),
   razorpayWebhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || process.env.PAYMENT_WEBHOOK_SECRET || 'dev-payment-webhook-secret',
-  adminBootstrapEmail: (process.env.ADMIN_BOOTSTRAP_EMAIL || 'admin@homestepin.local').toLowerCase(),
-  adminBootstrapPassword: (() => {
-    const pw = process.env.INITIAL_ADMIN_PASSWORD || process.env.ADMIN_BOOTSTRAP_PASSWORD || (!isProduction ? 'ChangeMe_Admin_1' : undefined);
-    if (isProduction && (!pw || FORBIDDEN_PROD_VALUES.has(pw) || pw.length < 12)) {
-      throw new Error('INITIAL_ADMIN_PASSWORD or ADMIN_BOOTSTRAP_PASSWORD must be a strong unique password of at least 12 characters in production');
+  // Initial admin bootstrapping is optional in production.
+  // When omitted or set to development defaults, existing admin accounts in MongoDB are preserved and startup succeeds normally.
+  adminBootstrapEmail: (() => {
+    let rawEmail = process.env.ADMIN_BOOTSTRAP_EMAIL;
+    if (isProduction && rawEmail === 'admin@homestepin.local') {
+      rawEmail = null;
     }
-    return pw || 'ChangeMe_Admin_1';
+    const candidate = rawEmail || process.env.INITIAL_ADMIN_EMAIL;
+    if (candidate && typeof candidate === 'string' && candidate.trim()) {
+      const email = candidate.trim().toLowerCase();
+      if (isProduction && email === 'admin@homestepin.local') {
+        return null;
+      }
+      return email;
+    }
+    return !isProduction ? 'admin@homestepin.local' : null;
+  })(),
+  adminBootstrapPassword: (() => {
+    const rawPw = process.env.INITIAL_ADMIN_PASSWORD || process.env.ADMIN_BOOTSTRAP_PASSWORD;
+    if (rawPw && typeof rawPw === 'string' && rawPw.trim()) {
+      const pw = rawPw.trim();
+      if (isProduction) {
+        if (FORBIDDEN_PROD_VALUES.has(pw)) {
+          // Ignore dev default passwords in production to preserve existing MongoDB admin accounts
+          return null;
+        }
+        if (pw.length < 12) {
+          throw new Error('When provided in production, INITIAL_ADMIN_PASSWORD or ADMIN_BOOTSTRAP_PASSWORD must be a strong unique password of at least 12 characters');
+        }
+      }
+      return pw;
+    }
+    // Optional in production: missing bootstrap credentials must never block startup
+    return !isProduction ? 'ChangeMe_Admin_1' : null;
   })(),
   publicBaseUrl: process.env.PUBLIC_BASE_URL || 'http://127.0.0.1:4001',
-  corsOrigins: process.env.CORS_ALLOWED_ORIGINS
-    ? csv('CORS_ALLOWED_ORIGINS')
-    : (isProduction ? ['*'] : ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:4001', 'http://127.0.0.1:4001']),
+  corsOrigins: isProduction
+    ? csv('CORS_ALLOWED_ORIGINS', required('CORS_ALLOWED_ORIGINS'))
+    : csv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4001,http://127.0.0.1:4001'),
   // Stored here for the forthcoming server-side Razorpay adapter. They are not
   // required until that adapter is enabled, so cash-on-service can launch safely.
   razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
@@ -99,10 +148,16 @@ module.exports = {
   emailFromName: (process.env.EMAIL_FROM_NAME || 'HomeStepIn').trim(),
 
   // =========================================
-  // Resend Email Delivery Configuration (Customer OTP)
+  // Resend Email Delivery Configuration (Customer & Worker OTP)
   // =========================================
   resendApiKey: (process.env.RESEND_API_KEY || '').trim(),
   resendFromEmail: (process.env.RESEND_FROM_EMAIL || 'HomeStepIn <onboarding@resend.dev>').trim(),
+
+  // =========================================
+  // OneSignal Push Notification Configuration
+  // =========================================
+  oneSignalAppId: (process.env.ONESIGNAL_APP_ID || '').trim(),
+  oneSignalRestApiKey: (process.env.ONESIGNAL_REST_API_KEY || '').trim(),
 
   otpSecret: required('OTP_SECRET', 'dev-otp-secret-long-random-hash-key-homestepin-local', 32),
   nodeEnv,

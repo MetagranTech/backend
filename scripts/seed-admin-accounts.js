@@ -57,13 +57,17 @@ async function seedAdminAccounts() {
         needsSave = true;
       }
 
-      // Check password match, update if needed
-      const isMatch = await bcrypt.compare(adminDef.password, existing.passwordHash || '');
-      if (!isMatch) {
-        existing.passwordHash = await bcrypt.hash(adminDef.password, 10);
-        existing.mustChangePassword = false;
-        needsSave = true;
-        console.log(`[Admin Seed] Synchronized credentials for Super Admin ${normalizedEmail}.`);
+      // Preserve existing custom password unless explicitly forced via RESET_ADMIN_PASSWORDS=true
+      if (process.env.RESET_ADMIN_PASSWORDS === 'true') {
+        const isMatch = await bcrypt.compare(adminDef.password, existing.passwordHash || '');
+        if (!isMatch) {
+          existing.passwordHash = await bcrypt.hash(adminDef.password, 10);
+          existing.mustChangePassword = false;
+          needsSave = true;
+          console.log(`[Admin Seed] Explicitly reset credentials for Super Admin ${normalizedEmail}.`);
+        }
+      } else {
+        console.log(`[Admin Seed] Preserving existing password for Super Admin ${normalizedEmail}.`);
       }
 
       if (needsSave) {

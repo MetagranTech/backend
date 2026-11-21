@@ -25,6 +25,9 @@ function getPeriodDateRange(period = '1week', customStart = null, customEnd = nu
   } else if (p === '1year' || p === 'year' || p === '1y') {
     startDate = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
     endDate = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999);
+  } else if (p === 'all' || p === 'alltime') {
+    startDate = new Date(2020, 0, 1, 0, 0, 0, 0);
+    endDate = new Date(now.getFullYear() + 1, 11, 31, 23, 59, 59, 999);
   } else if (p === 'custom' && customStart && customEnd) {
     const sParts = String(customStart).split('T')[0].split('-').map(Number);
     startDate = new Date(sParts[0], sParts[1] - 1, sParts[2], 0, 0, 0, 0);
@@ -44,6 +47,9 @@ function getPeriodDateRange(period = '1week', customStart = null, customEnd = nu
  * E.g., "17 Oct 2026 – 23 Oct 2026"
  */
 function formatRangeLabel(startDate, endDate) {
+  if (startDate && startDate.getFullYear() <= 2020) {
+    return 'All Time';
+  }
   const options = { day: '2-digit', month: 'short', year: 'numeric' };
   const sStr = startDate.toLocaleDateString('en-IN', options);
   const eStr = endDate.toLocaleDateString('en-IN', options);

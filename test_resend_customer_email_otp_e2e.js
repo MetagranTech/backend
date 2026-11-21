@@ -30,7 +30,7 @@
  * 21. Login with new password succeeds; old password fails
  *
  * PART D: Regression & Partner/Admin Isolation
- * 22. Partner registration preserved with Firebase flow
+ * 22. Partner registration handled via Admin provisioning & Resend OTP
  * 23. Partner forgot-password blocked (HTTP 403 PARTNER_PASSWORD_RESET_DISABLED)
  * 24. Admin login preserved intact (RBAC, direct admin authentication)
  * 25. Brevo transactional emails preserved (booking, status, payment, admin invitations)
