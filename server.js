@@ -2343,6 +2343,37 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
     orQueries.push({ employeeId: `EMP-${cleanId.toUpperCase()}` });
   }
 
+  // Admin ID / Username / Name prefix & domain resolution
+  if (cleanId.startsWith('adm-') || cleanId.startsWith('adm_')) {
+    const bare = cleanId.slice(4);
+    orQueries.push({ employeeId: `ADM-${bare.toUpperCase()}` });
+    orQueries.push({ employeeId: bare.toUpperCase() });
+    orQueries.push({ username: bare });
+    orQueries.push({ customId: `usr_adm_${bare}` });
+    orQueries.push({ email: `${bare}@homestepin.com` });
+    orQueries.push({ email: `${bare}@homestep.in` });
+  } else {
+    orQueries.push({ employeeId: `ADM-${cleanId.toUpperCase()}` });
+    orQueries.push({ customId: `usr_adm_${cleanId}` });
+  }
+
+  // If user entered short name/username without @ or +, resolve to platform domain emails and match admin name
+  if (!cleanId.includes('@') && !rawId.startsWith('+')) {
+    const escaped = rawId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    orQueries.push({ email: `${cleanId}@homestepin.com` });
+    orQueries.push({ email: `${cleanId}@homestep.in` });
+    // Match admin by name case-insensitively
+    orQueries.push({
+      role: 'admin',
+      name: { $regex: new RegExp(`^${escaped}$`, 'i') },
+    });
+    // Match admin by username case-insensitively
+    orQueries.push({
+      role: 'admin',
+      username: { $regex: new RegExp(`^${cleanId}$`, 'i') },
+    });
+  }
+
   const user = await User.findOne({
     $or: orQueries,
   }).select('+passwordHash');
