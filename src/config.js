@@ -112,7 +112,7 @@ module.exports = {
   publicBaseUrl: process.env.PUBLIC_BASE_URL || 'http://127.0.0.1:4001',
   corsOrigins: isProduction
     ? csv('CORS_ALLOWED_ORIGINS', required('CORS_ALLOWED_ORIGINS'))
-    : csv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4001,http://127.0.0.1:4001'),
+    : csv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4001,http://127.0.0.1:4001,http://localhost:8081,http://127.0.0.1:8081'),
   // Stored here for the forthcoming server-side Razorpay adapter. They are not
   // required until that adapter is enabled, so cash-on-service can launch safely.
   razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
