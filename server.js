@@ -1332,7 +1332,7 @@ app.use(
       // Native mobile clients do not send an Origin header. Browser origins must
       // be explicitly allow-listed in production.
       if (!origin || config.corsOrigins.includes(origin)) return callback(null, true);
-      return callback(new Error('Origin is not allowed by CORS policy'));
+      return callback(null, false);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -2378,7 +2378,18 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
     $or: orQueries,
   }).select('+passwordHash');
 
-  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+  const userFound = Boolean(user);
+  let passwordMatch = false;
+  if (user && user.passwordHash && typeof user.passwordHash === 'string') {
+    passwordMatch = await bcrypt.compare(password, user.passwordHash);
+  }
+  const roleValid = user ? (user.role === 'admin' || user.role === 'customer' || user.role === 'worker') : false;
+
+  console.log(
+    `[Auth Diagnostic] [${req.requestId || 'NO-REQ-ID'}] DB: "${mongoose.connection.name || 'unknown'}" | Collection: "${User.collection.name}" | User Lookup: ${userFound ? 'found' : 'not_found'} | Has Hash: ${Boolean(user?.passwordHash)} | Password Comparison: ${passwordMatch ? 'passed' : 'failed'} | Role: "${user?.role || 'none'}" | Admin Role: "${user?.adminRole || 'none'}" | Role Validation: ${roleValid ? 'passed' : 'failed'}`
+  );
+
+  if (!user || !passwordMatch) {
     return res.status(401).json({ error: 'Invalid credentials. Please check your details.' });
   }
 
