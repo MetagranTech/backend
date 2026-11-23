@@ -156,10 +156,10 @@ module.exports = {
   // =========================================
   // OneSignal Push Notification Configuration
   // =========================================
-  oneSignalAppId: (process.env.ONESIGNAL_APP_ID || '28d1903d-40bf-4e76-9e0a-b2b005df2aae').trim(),
-  oneSignalRestApiKey: (process.env.ONESIGNAL_REST_API_KEY || '').trim(),
-  oneSignalPartnerAppId: (process.env.ONESIGNAL_PARTNER_APP_ID || '3ad71bb0-508d-4b7d-a09f-64754400c57b').trim(),
-  oneSignalPartnerRestApiKey: (process.env.ONESIGNAL_PARTNER_REST_API_KEY || process.env.ONESIGNAL_REST_API_KEY || '').trim(),
+  oneSignalAppId: (process.env.ONESIGNAL_APP_ID || process.env.ONESIGNAL_CUSTOMER_APP_ID || '28d1903d-40bf-4e76-9e0a-b2b005df2aae').trim(),
+  oneSignalRestApiKey: (process.env.ONESIGNAL_REST_API_KEY || process.env.ONESIGNAL_API_KEY || process.env.ONESIGNAL_KEY || process.env.ONE_SIGNAL_REST_API_KEY || process.env.ONE_SIGNAL_API_KEY || '').trim(),
+  oneSignalPartnerAppId: (process.env.ONESIGNAL_PARTNER_APP_ID || process.env.ONESIGNAL_WORKER_APP_ID || '3ad71bb0-508d-4b7d-a09f-64754400c57b').trim(),
+  oneSignalPartnerRestApiKey: (process.env.ONESIGNAL_PARTNER_REST_API_KEY || process.env.ONESIGNAL_PARTNER_API_KEY || process.env.ONESIGNAL_PARTNER_KEY || process.env.ONESIGNAL_WORKER_REST_API_KEY || process.env.ONESIGNAL_WORKER_API_KEY || process.env.ONESIGNAL_REST_API_KEY || process.env.ONESIGNAL_API_KEY || process.env.ONESIGNAL_KEY || '').trim(),
 
   otpSecret: required('OTP_SECRET', 'dev-otp-secret-long-random-hash-key-homestepin-local', 32),
   nodeEnv,

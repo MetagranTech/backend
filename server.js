@@ -10306,20 +10306,81 @@ app.post('/api/notifications/fcm-token/deregister', authRequired, handleDeregist
 app.delete('/api/auth/fcm-token', authRequired, handleDeregisterPushToken);
 app.post('/api/notifications/unregister-device', authRequired, handleDeregisterPushToken);
 
-// Public notification configuration endpoint (OneSignal App ID discovery)
-app.get('/api/notifications/public-config', (req, res) => {
+// Public notification configuration & safe diagnostic endpoint
+app.get('/api/notifications/public-config', async (req, res) => {
   const role = String(req.query.role || req.query.type || '').toLowerCase();
   const isWorker = role === 'worker' || role === 'partner';
   const customerConfig = oneSignalService.getOneSignalConfig('customer');
   const partnerConfig = oneSignalService.getOneSignalConfig('partner');
-  res.json({
+
+  const envKeyScan = {
+    ONESIGNAL_REST_API_KEY: Boolean(process.env.ONESIGNAL_REST_API_KEY),
+    ONESIGNAL_API_KEY: Boolean(process.env.ONESIGNAL_API_KEY),
+    ONESIGNAL_KEY: Boolean(process.env.ONESIGNAL_KEY),
+    ONESIGNAL_PARTNER_REST_API_KEY: Boolean(process.env.ONESIGNAL_PARTNER_REST_API_KEY),
+    ONESIGNAL_PARTNER_API_KEY: Boolean(process.env.ONESIGNAL_PARTNER_API_KEY),
+    ONESIGNAL_PARTNER_KEY: Boolean(process.env.ONESIGNAL_PARTNER_KEY),
+    ONE_SIGNAL_REST_API_KEY: Boolean(process.env.ONE_SIGNAL_REST_API_KEY),
+    ONE_SIGNAL_API_KEY: Boolean(process.env.ONE_SIGNAL_API_KEY),
+  };
+
+  const baseResponse = {
     oneSignalAppId: isWorker
       ? (config.oneSignalPartnerAppId || process.env.ONESIGNAL_PARTNER_APP_ID || '3ad71bb0-508d-4b7d-a09f-64754400c57b')
       : (config.oneSignalAppId || process.env.ONESIGNAL_APP_ID || '28d1903d-40bf-4e76-9e0a-b2b005df2aae'),
     customerConfigured: Boolean(customerConfig.isConfigured),
     partnerConfigured: Boolean(partnerConfig.isConfigured),
     partnerHasDedicatedKey: Boolean(process.env.ONESIGNAL_PARTNER_REST_API_KEY && process.env.ONESIGNAL_PARTNER_REST_API_KEY !== process.env.ONESIGNAL_REST_API_KEY),
-  });
+    envKeyScan,
+  };
+
+  // Safe read-only diagnostics for troubleshooting production booking dispatches
+  if (req.query.diagnostics === '1' || req.query.debug === '1') {
+    try {
+      const [recentBookings, recentOutbox, activeWorkers] = await Promise.all([
+        Booking.find({}).sort({ createdAt: -1 }).limit(3).select('customId service category date time status createdAt').lean(),
+        NotificationOutbox.find({}).sort({ createdAt: -1 }).limit(5).select('notificationId type channel status attempts lastError providerMessageId createdAt deliveredAt').lean(),
+        User.find({ role: { $in: ['worker', 'partner'] }, status: { $in: ['active', 'approved'] } })
+          .select('customId role status online services approvedServices pushSubscriptions')
+          .lean(),
+      ]);
+
+      return res.json({
+        ...baseResponse,
+        diagnostics: {
+          activePartnerCount: activeWorkers.length,
+          activePartners: activeWorkers.map(w => ({
+            id: w.customId || (w._id ? String(w._id).slice(-6) : 'unknown'),
+            role: w.role,
+            online: w.online,
+            services: w.services || [],
+            approvedServices: w.approvedServices || [],
+            pushSubscriptionsCount: Array.isArray(w.pushSubscriptions) ? w.pushSubscriptions.length : 0,
+          })),
+          recentBookings: recentBookings.map(b => ({
+            bookingId: b.customId,
+            service: b.service,
+            category: b.category,
+            status: b.status,
+            createdAt: b.createdAt,
+          })),
+          recentOutbox: recentOutbox.map(o => ({
+            type: o.type,
+            status: o.status,
+            channel: o.channel,
+            attempts: o.attempts,
+            lastError: o.lastError,
+            deliveredAt: o.deliveredAt,
+            createdAt: o.createdAt,
+          })),
+        },
+      });
+    } catch (e) {
+      return res.json({ ...baseResponse, diagnosticError: e.message });
+    }
+  }
+
+  return res.json(baseResponse);
 });
 
 // Get User Notifications (Paginated, Filterable & Strict User Scoped)

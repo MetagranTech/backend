@@ -26,11 +26,26 @@ const testInbox = [];
 function getOneSignalConfig(appType = 'customer') {
   let appId, apiKey;
   if (appType === 'partner' || appType === 'worker') {
-    appId = (process.env.ONESIGNAL_PARTNER_APP_ID || config.oneSignalPartnerAppId || '3ad71bb0-508d-4b7d-a09f-64754400c57b').trim();
-    apiKey = (process.env.ONESIGNAL_PARTNER_REST_API_KEY || config.oneSignalPartnerRestApiKey || process.env.ONESIGNAL_REST_API_KEY || config.oneSignalRestApiKey || '').trim();
+    appId = (process.env.ONESIGNAL_PARTNER_APP_ID || process.env.ONESIGNAL_WORKER_APP_ID || config.oneSignalPartnerAppId || '3ad71bb0-508d-4b7d-a09f-64754400c57b').trim();
+    apiKey = (
+      process.env.ONESIGNAL_PARTNER_REST_API_KEY ||
+      process.env.ONESIGNAL_PARTNER_API_KEY ||
+      process.env.ONESIGNAL_PARTNER_KEY ||
+      config.oneSignalPartnerRestApiKey ||
+      process.env.ONESIGNAL_REST_API_KEY ||
+      process.env.ONESIGNAL_API_KEY ||
+      config.oneSignalRestApiKey ||
+      ''
+    ).trim();
   } else {
-    appId = (process.env.ONESIGNAL_APP_ID || config.oneSignalAppId || '28d1903d-40bf-4e76-9e0a-b2b005df2aae').trim();
-    apiKey = (process.env.ONESIGNAL_REST_API_KEY || config.oneSignalRestApiKey || '').trim();
+    appId = (process.env.ONESIGNAL_APP_ID || process.env.ONESIGNAL_CUSTOMER_APP_ID || config.oneSignalAppId || '28d1903d-40bf-4e76-9e0a-b2b005df2aae').trim();
+    apiKey = (
+      process.env.ONESIGNAL_REST_API_KEY ||
+      process.env.ONESIGNAL_API_KEY ||
+      process.env.ONESIGNAL_KEY ||
+      config.oneSignalRestApiKey ||
+      ''
+    ).trim();
   }
   const isConfigured = Boolean(appId && apiKey && !apiKey.startsWith('your_') && !appId.startsWith('your_'));
 
