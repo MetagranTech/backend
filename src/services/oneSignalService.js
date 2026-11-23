@@ -134,6 +134,12 @@ async function sendOneSignalRequest(payload, appType = 'customer') {
               const errorMessage = Array.isArray(data?.errors) ? data.errors.join('; ') : (data?.errors || `OneSignal HTTP ${res.statusCode}`);
               const isTransient = res.statusCode === 429 || res.statusCode >= 500;
               const isPermanent = !isTransient;
+              if (process.env.NODE_ENV !== 'test') {
+                console.error(`[ONESIGNAL_HTTP_ERR] appType=${appType} appId=${appId} status=${res.statusCode} error="${errorMessage}"`);
+                if ((appType === 'partner' || appType === 'worker') && (res.statusCode === 400 || res.statusCode === 403)) {
+                  console.error(`[ONESIGNAL_CONFIG_WARNING] Partner push rejected (HTTP ${res.statusCode}). Please ensure ONESIGNAL_PARTNER_REST_API_KEY is configured in Render environment variables for Partner App ID ${appId}.`);
+                }
+              }
               return resolve({
                 success: false,
                 error: errorMessage,
@@ -143,8 +149,12 @@ async function sendOneSignalRequest(payload, appType = 'customer') {
                 data,
               });
             }
+
             if (data?.id) {
               const recipientCount = typeof data.recipients === 'number' ? data.recipients : 0;
+              if (process.env.NODE_ENV !== 'test') {
+                console.log(`[ONESIGNAL_HTTP_SUCCESS] appType=${appType} appId=${appId} providerId=${data.id} recipients=${recipientCount}`);
+              }
               if (recipientCount === 0) {
                 return resolve({
                   success: false,
@@ -237,16 +247,25 @@ async function sendNotificationToUser(userId, { title, body, data = {}, sound = 
             ...(isOid ? [{ _id: userId }] : []),
             { customId: userId },
             { id: userId },
+            { employeeId: userId },
           ]
-        }).select('_id customId pushSubscriptions role').lean();
+        }).select('_id customId employeeId pushSubscriptions fcmTokens role').lean();
         if (u) {
           if (u._id) externalIds.add(String(u._id));
           if (u.customId) externalIds.add(String(u.customId));
+          if (u.employeeId) externalIds.add(String(u.employeeId));
           if (Array.isArray(u.pushSubscriptions) && u.pushSubscriptions.length > 0) {
             userSubscriptions = u.pushSubscriptions
               .map(s => s.subscriptionId || s.token)
               .filter(Boolean)
               .map(String);
+          }
+          if (Array.isArray(u.fcmTokens) && u.fcmTokens.length > 0) {
+            for (const t of u.fcmTokens) {
+              if (t && t.token && !userSubscriptions.includes(String(t.token))) {
+                userSubscriptions.push(String(t.token));
+              }
+            }
           }
         }
       }

@@ -162,14 +162,62 @@ async function getEligibleWorkerCandidates(service, category) {
   if (cached && now - cached.ts < 2000) {
     return cached.workers;
   }
-  const workers = await User.find({
-    role: 'worker',
-    status: 'active',
+
+  const sNorm = (service || '').trim();
+  const cNorm = (category || '').trim();
+  const sWords = sNorm.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const cWords = cNorm.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const keywords = Array.from(new Set([...sWords, ...cWords]));
+
+  const serviceMatchingConditions = [
+    { services: { $in: [service, category] } },
+    { approvedServices: { $in: [service, category] } },
+    ...(sNorm ? [{ services: { $elemMatch: { $regex: new RegExp(escapeRegex(sNorm), 'i') } } }] : []),
+    ...(cNorm ? [{ services: { $elemMatch: { $regex: new RegExp(escapeRegex(cNorm), 'i') } } }] : []),
+    ...(sNorm ? [{ approvedServices: { $elemMatch: { $regex: new RegExp(escapeRegex(sNorm), 'i') } } }] : []),
+    ...(cNorm ? [{ approvedServices: { $elemMatch: { $regex: new RegExp(escapeRegex(cNorm), 'i') } } }] : []),
+    ...keywords.map(kw => ({ services: { $elemMatch: { $regex: new RegExp(escapeRegex(kw), 'i') } } })),
+    ...keywords.map(kw => ({ approvedServices: { $elemMatch: { $regex: new RegExp(escapeRegex(kw), 'i') } } })),
+    { services: { $size: 0 } },
+    { services: { $exists: false } },
+    { services: { $in: ['All', 'all', 'General', 'Home Service'] } },
+  ];
+
+  const baseWorkerQuery = {
+    role: { $in: ['worker', 'partner'] },
+    status: { $in: ['active', 'approved'] },
+  };
+
+  // 1. First priority: active workers matching service who are currently marked online
+  let workers = await User.find({
+    ...baseWorkerQuery,
     online: true,
-    services: { $in: [service, category] },
+    $or: serviceMatchingConditions,
   })
-    .select('_id customId name phone latitude longitude serviceRadiusKm')
+    .select('_id customId employeeId name phone latitude longitude serviceRadiusKm online pushSubscriptions services approvedServices')
     .lean();
+
+  // 2. Second priority: if no online workers match, include all active workers matching service
+  // (Push notifications exist to wake up and notify backgrounded/offline workers on their devices!)
+  if (!workers || workers.length === 0) {
+    workers = await User.find({
+      ...baseWorkerQuery,
+      $or: serviceMatchingConditions,
+    })
+      .select('_id customId employeeId name phone latitude longitude serviceRadiusKm online pushSubscriptions services approvedServices')
+      .lean();
+    console.log(`[WORKER_DISCOVERY] Expanded to offline/background workers for service="${service}": found ${workers?.length || 0}`);
+  }
+
+  // 3. Safety Net: In HomeStepIn's primary service city (Trichy), if service matching returned 0,
+  // notify all active approved partners in the area so no customer booking is ever dropped without alerts
+  if (!workers || workers.length === 0) {
+    workers = await User.find(baseWorkerQuery)
+      .select('_id customId employeeId name phone latitude longitude serviceRadiusKm online pushSubscriptions services approvedServices')
+      .lean();
+    console.log(`[WORKER_DISCOVERY_SAFETY_NET] Fallback to all active partners in service area: found ${workers?.length || 0}`);
+  }
+
   workerCandidateCache.set(cacheKey, { workers, ts: now });
   return workers;
 }
@@ -664,12 +712,18 @@ function setupWebSocketServer(httpServer) {
 
         ws.user = decoded;
         registerUserSockets(decoded, ws);
+        if (dbUser && (decoded.role === 'worker' || decoded.role === 'partner')) {
+          User.updateOne({ _id: dbUser._id }, { $set: { online: true } }).catch(() => {});
+        }
         console.log(`[WS_AUTH] userId=${userId} role=${decoded.role || 'unknown'}`);
         ws.send(JSON.stringify({ type: 'authenticated', user: decoded }));
         return decoded;
       } catch (err) {
         ws.user = decoded;
         registerUserSockets(decoded, ws);
+        if (decoded && (decoded.role === 'worker' || decoded.role === 'partner')) {
+          User.updateOne({ $or: [{ customId: userId }, { _id: userId }] }, { $set: { online: true } }).catch(() => {});
+        }
         console.log(`[WS_AUTH] userId=${userId} role=${decoded.role || 'unknown'} (cache-fallback)`);
         ws.send(JSON.stringify({ type: 'authenticated', user: decoded }));
         return decoded;
@@ -6700,25 +6754,38 @@ async function handleCreateBooking(req, res) {
   const busyWorkerIds = new Set(busyWorkerBookings.map(b => String(b.providerId)));
 
   // 2. Filter workers by busy status and service radius
-  const bookingLat = newBooking.latitude;
-  const bookingLng = newBooking.longitude;
+  const bookingLat = typeof newBooking.latitude === 'number' && !isNaN(newBooking.latitude) ? newBooking.latitude : null;
+  const bookingLng = typeof newBooking.longitude === 'number' && !isNaN(newBooking.longitude) ? newBooking.longitude : null;
   const payoutAmount = Math.round((newBooking.priceNum || 500) * 0.8);
   const payoutFormatted = `₹${payoutAmount}`;
+
+  console.log(`[BOOKING_DISPATCH_START] bookingId=${newBooking.customId} service="${newBooking.service}" category="${newBooking.category}" customerId=${newBooking.customerId} potentialWorkersFound=${potentialWorkers.length}`);
 
   const eligibleWorkers = [];
 
   for (const worker of potentialWorkers) {
-    const workerIdStr = worker._id.toString();
-    if (busyWorkerIds.has(workerIdStr) || busyWorkerIds.has(worker.customId)) {
+    const workerIdStr = worker._id ? worker._id.toString() : (worker.customId || worker.id);
+    if (!workerIdStr) continue;
+
+    if (busyWorkerIds.has(workerIdStr) || (worker.customId && busyWorkerIds.has(worker.customId))) {
+      console.log(`[WORKER_BUSY_SKIP] workerId=${workerIdStr} is currently assigned to active job`);
       continue;
     }
 
-    // Distance calculation if worker coordinates exist
+    // Distance calculation only if BOTH worker AND booking have valid non-zero coordinates
     let distKm = 0;
-    if (typeof worker.latitude === 'number' && typeof worker.longitude === 'number') {
+    if (
+      typeof worker.latitude === 'number' && typeof worker.longitude === 'number' &&
+      worker.latitude !== 0 && worker.longitude !== 0 &&
+      bookingLat !== null && bookingLng !== null &&
+      bookingLat !== 0 && bookingLng !== 0
+    ) {
       distKm = calculateHaversineDistanceKm(worker.latitude, worker.longitude, bookingLat, bookingLng);
       const maxRadius = worker.serviceRadiusKm || 25;
-      if (distKm > maxRadius) continue;
+      if (distKm > maxRadius) {
+        console.log(`[WORKER_DISTANCE_SKIP] workerId=${workerIdStr} distKm=${distKm.toFixed(1)} > maxRadius=${maxRadius}`);
+        continue;
+      }
     }
 
     eligibleWorkers.push({
@@ -6727,15 +6794,31 @@ async function handleCreateBooking(req, res) {
     });
   }
 
-  // 3. Dispatch targeted notifications and WebSocket alerts using efficient batch insertion
+  // Safety Net: If distance filter excluded all workers (e.g. mobile GPS variance in Trichy),
+  // retain candidate workers in the service area so the dispatch is not left with 0 workers
+  if (eligibleWorkers.length === 0 && potentialWorkers.length > 0) {
+    console.log(`[WORKER_DISTANCE_SAFETY_NET] Retaining all ${potentialWorkers.length} candidate workers in area`);
+    for (const worker of potentialWorkers) {
+      const workerIdStr = worker._id ? worker._id.toString() : (worker.customId || worker.id);
+      if (!workerIdStr || busyWorkerIds.has(workerIdStr)) continue;
+      eligibleWorkers.push({ worker, distanceKm: 0 });
+    }
+  }
+
+  // 3. Dispatch targeted notifications, durable outbox jobs, immediate push, and WebSocket alerts
   const candidateBatch = eligibleWorkers;
+  const eligibleWorkerIds = candidateBatch.map(item => {
+    const wDoc = item.worker || item;
+    return wDoc._id ? wDoc._id.toString() : (wDoc.customId || wDoc.id);
+  }).filter(Boolean);
+
+  console.log(`[BOOKING_DISPATCH_ELIGIBLE] bookingId=${newBooking.customId} eligibleCount=${candidateBatch.length} workerIds=${eligibleWorkerIds.join(',')}`);
 
   if (candidateBatch.length > 0) {
     const notifBatch = [];
     const outboxBatch = [];
 
     for (const item of candidateBatch) {
-      // Robust resolution of nested worker document from { worker, distanceKm } or worker directly
       const workerDoc = item.worker || item;
       const distanceKm = typeof item.distanceKm === 'number' ? item.distanceKm : 0;
       const workerIdStr = workerDoc._id ? workerDoc._id.toString() : (workerDoc.customId || workerDoc.id);
@@ -6748,6 +6831,9 @@ async function handleCreateBooking(req, res) {
       const formattedDistance = distanceKm > 0 ? `${distanceKm} km` : 'Near you';
       const notificationId = `notif_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const eventId = `evt_offer_${newBooking.customId}_${workerIdStr}`;
+      const title = 'New Service Request Available! ⚡';
+      const body = `New ${newBooking.service} job in ${newBooking.area || newBooking.city || 'Trichy'} (${formattedDistance}). Payout: ${payoutFormatted}`;
+      const deepLink = `homestepin://bookings/${newBooking.customId}`;
 
       notifBatch.push({
         notificationId,
@@ -6755,10 +6841,10 @@ async function handleCreateBooking(req, res) {
         eventId,
         type: 'NEW_JOB_OFFER',
         priority: 'CRITICAL',
-        title: 'New Service Request Available',
-        body: `New ${newBooking.service} job in ${newBooking.area || newBooking.city} (${formattedDistance}).`,
+        title,
+        body,
         bookingId: newBooking.customId,
-        deepLink: `homestepin://bookings/${newBooking.customId}`,
+        deepLink,
         read: false,
       });
 
@@ -6769,9 +6855,9 @@ async function handleCreateBooking(req, res) {
         type: 'NEW_JOB_OFFER',
         channel: 'PUSH',
         payload: {
-          title: 'New Service Request Available',
-          body: `New ${newBooking.service} job in ${newBooking.area || newBooking.city} (${formattedDistance}).`,
-          deepLink: `homestepin://bookings/${newBooking.customId}`,
+          title,
+          body,
+          deepLink,
           bookingId: newBooking.customId,
           metadata: {
             type: 'NEW_JOB_OFFER',
@@ -6779,6 +6865,7 @@ async function handleCreateBooking(req, res) {
             category: newBooking.category,
             bookingId: newBooking.customId,
             distance: formattedDistance,
+            payout: payoutFormatted,
             workerCustomId: workerDoc.customId || null,
             workerMongoId: workerDoc._id ? workerDoc._id.toString() : null,
           },
@@ -6789,6 +6876,8 @@ async function handleCreateBooking(req, res) {
           },
         },
         status: 'PENDING',
+        priority: 10,
+        attempts: 0,
       });
     }
 
@@ -6812,6 +6901,49 @@ async function handleCreateBooking(req, res) {
           console.warn('[Outbox Create Warning] Could not insert outbox record for worker:', e.message);
         }
       }
+    }
+
+    // Direct immediate OneSignal push dispatch for every eligible partner
+    for (const item of candidateBatch) {
+      const workerDoc = item.worker || item;
+      const workerIdStr = workerDoc._id ? workerDoc._id.toString() : (workerDoc.customId || workerDoc.id);
+      if (!workerIdStr) continue;
+
+      const formattedDistance = item.distanceKm > 0 ? `${item.distanceKm} km` : 'Near you';
+      const title = 'New Service Request Available! ⚡';
+      const body = `New ${newBooking.service} job in ${newBooking.area || newBooking.city || 'Trichy'} (${formattedDistance}). Payout: ${payoutFormatted}`;
+
+      oneSignalService.sendNotificationToUser(workerIdStr, {
+        title,
+        body,
+        data: {
+          type: 'NEW_JOB_OFFER',
+          bookingId: String(newBooking.customId),
+          service: newBooking.service,
+          category: newBooking.category,
+          payout: payoutFormatted,
+          distance: formattedDistance,
+          deepLink: `homestepin://bookings/${newBooking.customId}`,
+        },
+        sound: 'homestepin_notification.wav',
+      }, 'partner').then(async (dispatchRes) => {
+        console.log(`[BOOKING_PARTNER_PUSH] bookingId=${newBooking.customId} workerId=${workerIdStr} success=${dispatchRes?.success} recipients=${dispatchRes?.recipients} providerId=${dispatchRes?.id || 'none'}`);
+        if (dispatchRes && dispatchRes.success && dispatchRes.recipients > 0) {
+          await NotificationOutbox.updateOne(
+            { recipientId: workerIdStr, type: 'NEW_JOB_OFFER', 'payload.bookingId': newBooking.customId },
+            {
+              $set: {
+                status: 'DELIVERED',
+                deliveredAt: new Date(),
+                providerMessageId: String(dispatchRes.id),
+                providerResponse: { id: dispatchRes.id, recipients: dispatchRes.recipients, targetedBy: dispatchRes.targetedBy || 'alias' },
+              }
+            }
+          ).catch(() => {});
+        }
+      }).catch(err => {
+        console.warn(`[BOOKING_PARTNER_PUSH_ERR] bookingId=${newBooking.customId} workerId=${workerIdStr} error=${err.message}`);
+      });
     }
 
     // Offload real-time socket broadcasting to next event tick
@@ -10123,6 +10255,11 @@ async function handleRegisterPushToken(req, res) {
     user.fcmTokens = user.fcmTokens.slice(-10);
   }
 
+  // 3. Mark worker as online upon active push subscription registration
+  if (user.role === 'worker' || user.role === 'partner') {
+    user.online = true;
+  }
+
   await user.save();
 
   return res.json({
@@ -10173,10 +10310,15 @@ app.post('/api/notifications/unregister-device', authRequired, handleDeregisterP
 app.get('/api/notifications/public-config', (req, res) => {
   const role = String(req.query.role || req.query.type || '').toLowerCase();
   const isWorker = role === 'worker' || role === 'partner';
+  const customerConfig = oneSignalService.getOneSignalConfig('customer');
+  const partnerConfig = oneSignalService.getOneSignalConfig('partner');
   res.json({
     oneSignalAppId: isWorker
       ? (config.oneSignalPartnerAppId || process.env.ONESIGNAL_PARTNER_APP_ID || '3ad71bb0-508d-4b7d-a09f-64754400c57b')
       : (config.oneSignalAppId || process.env.ONESIGNAL_APP_ID || '28d1903d-40bf-4e76-9e0a-b2b005df2aae'),
+    customerConfigured: Boolean(customerConfig.isConfigured),
+    partnerConfigured: Boolean(partnerConfig.isConfigured),
+    partnerHasDedicatedKey: Boolean(process.env.ONESIGNAL_PARTNER_REST_API_KEY && process.env.ONESIGNAL_PARTNER_REST_API_KEY !== process.env.ONESIGNAL_REST_API_KEY),
   });
 });
 
