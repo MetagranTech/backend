@@ -26,9 +26,12 @@ async function runTests() {
 
   // 1. OneSignal Configuration Helper
   console.log('TEST 1: Configuration Validation');
-  const cfg = oneSignalService.getOneSignalConfig();
+  const cfg = oneSignalService.getOneSignalConfig('customer');
   assert(typeof cfg.isConfigured === 'boolean', 'isConfigured is boolean');
-  pass('Configuration validation returns status object');
+  assert(cfg.appId === '28d1903d-40bf-4e76-9e0a-b2b005df2aae', 'Customer OneSignal App ID matches');
+  const partnerCfg = oneSignalService.getOneSignalConfig('partner');
+  assert(partnerCfg.appId === '3ad71bb0-508d-4b7d-a09f-64754400c57b', 'Partner OneSignal App ID matches');
+  pass('Configuration validation returns status object with correct Customer and Partner App IDs');
 
   // 2. Test Transport Interceptor
   console.log('\nTEST 2: Test Transport Interceptor');

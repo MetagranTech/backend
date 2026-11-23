@@ -21,16 +21,26 @@ async function notify(userId, { title, body, type, booking, data, dedupeKey }) {
 
   // Dispatch background push notification via OneSignal (non-blocking)
   if (userId) {
-    oneSignalService
-      .sendNotificationToUser(userId, {
-        title,
-        body,
-        data: {
-          ...(data || {}),
-          type,
-          bookingId: booking ? String(booking) : null,
-          notificationId: String(doc._id),
-        },
+    const User = require('./models/User');
+    User.findById(userId)
+      .select('role')
+      .lean()
+      .then(u => {
+        const appType = u?.role === 'worker' ? 'partner' : 'customer';
+        return oneSignalService.sendNotificationToUser(
+          userId,
+          {
+            title,
+            body,
+            data: {
+              ...(data || {}),
+              type,
+              bookingId: booking ? String(booking) : null,
+              notificationId: String(doc._id),
+            },
+          },
+          appType
+        );
       })
       .catch(err => console.warn('[Push Notification Dispatch Warning]:', err.message));
   }

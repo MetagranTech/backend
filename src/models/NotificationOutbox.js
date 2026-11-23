@@ -17,6 +17,8 @@ const notificationOutboxSchema = new mongoose.Schema(
     attempts: { type: Number, default: 0 },
     maxAttempts: { type: Number, default: 5 },
     lastError: { type: String, default: null },
+    providerMessageId: { type: String, default: null, index: true },
+    providerResponse: { type: mongoose.Schema.Types.Mixed, default: null },
     nextRetryAt: { type: Date, default: Date.now, index: true },
     deliveredAt: { type: Date, default: null },
     lockedBy: { type: String, default: null, index: true },

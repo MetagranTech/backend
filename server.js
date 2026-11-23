@@ -451,6 +451,35 @@ function broadcastToRoom(roomName, payload, excludeSocket = null, broadcastToClu
   }
 }
 
+/**
+ * Deduplicated broadcast directly to target user IDs.
+ * Ensures that if a user has multiple aliases (sub, customId, _id) or multiple sockets,
+ * each active socket receives the message exactly once, eliminating duplicate WebRTC signaling.
+ */
+function broadcastToUsers(userIds, payload, excludeSocket = null) {
+  const rawList = Array.isArray(userIds) ? userIds : [userIds];
+  const targetIds = rawList.filter(Boolean).map(String);
+  if (targetIds.length === 0) return;
+
+  const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const sentSockets = new Set();
+
+  for (const uid of targetIds) {
+    const roomName = `user_${uid}`;
+    const sockets = roomSockets.get(roomName);
+    if (sockets) {
+      for (const ws of sockets) {
+        if (ws !== excludeSocket && ws.readyState === WebSocket.OPEN && !sentSockets.has(ws)) {
+          sentSockets.add(ws);
+          try {
+            ws.send(data);
+          } catch (e) {}
+        }
+      }
+    }
+  }
+}
+
 // Listen for cross-worker WebSocket broadcasts forwarded by primary process
 if (typeof process.on === 'function') {
   process.on('message', (msg) => {
@@ -574,6 +603,8 @@ function setupWebSocketServer(httpServer) {
     ws.isAlive = true;
     ws.rooms = new Set();
     ws.user = null;
+    const clientIp = req.socket?.remoteAddress || 'unknown';
+    console.log(`[WS_CONNECT] ip=${clientIp}`);
 
     ws.on('pong', () => {
       ws.isAlive = true;
@@ -633,11 +664,13 @@ function setupWebSocketServer(httpServer) {
 
         ws.user = decoded;
         registerUserSockets(decoded, ws);
+        console.log(`[WS_AUTH] userId=${userId} role=${decoded.role || 'unknown'}`);
         ws.send(JSON.stringify({ type: 'authenticated', user: decoded }));
         return decoded;
       } catch (err) {
         ws.user = decoded;
         registerUserSockets(decoded, ws);
+        console.log(`[WS_AUTH] userId=${userId} role=${decoded.role || 'unknown'} (cache-fallback)`);
         ws.send(JSON.stringify({ type: 'authenticated', user: decoded }));
         return decoded;
       }
@@ -932,6 +965,21 @@ function setupWebSocketServer(httpServer) {
             receiverRole = 'customer';
           }
 
+          // Ensure only one active call session per booking (clean up any previous ringing/active session)
+          await CallSession.updateMany(
+            {
+              bookingId: booking.customId || booking.id,
+              status: { $in: ['CALL_RINGING', 'CALL_CONNECTED'] },
+            },
+            {
+              $set: {
+                status: 'CALL_ENDED',
+                endedAt: new Date(),
+                endReason: 'superseded',
+              },
+            }
+          ).catch(() => {});
+
           const callSession = await CallSession.create({
             callSessionId: `CALL-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
             bookingId: booking.customId || booking.id,
@@ -946,6 +994,8 @@ function setupWebSocketServer(httpServer) {
             maskedLine: true,
           });
 
+          console.log(`[CALL_SIGNALING] callId=${callSession.callSessionId} action=initiate caller=${user.sub} receiver=${receiverId} bookingId=${booking.customId || booking.id}`);
+
           // Timeout if unanswered after 35s
           setTimeout(async () => {
             try {
@@ -956,6 +1006,20 @@ function setupWebSocketServer(httpServer) {
                 pendingSession.durationSeconds = 0;
                 pendingSession.endReason = 'missed';
                 await pendingSession.save();
+                console.log(`[CALL_SIGNALING] callId=${pendingSession.callSessionId} action=missed_timeout`);
+
+                // Suppress any pending ringing push notification
+                NotificationOutbox.updateMany(
+                  {
+                    channel: 'PUSH',
+                    $or: [
+                      { 'payload.metadata.callSessionId': pendingSession.callSessionId },
+                      { notificationId: `call_init_${pendingSession.callSessionId}` }
+                    ],
+                    status: { $in: ['PENDING', 'PROCESSING', 'FAILED'] },
+                  },
+                  { $set: { status: 'DEAD_LETTER', lastError: 'Call missed / timed out before delivery', nextRetryAt: null } }
+                ).catch(() => {});
 
                 const missedPayload = {
                   type: 'call_ended',
@@ -995,6 +1059,32 @@ function setupWebSocketServer(httpServer) {
             if (booking.customer) broadcastToRoom(`user_${booking.customer}`, incomingPayload);
           }
 
+          // Enqueue exactly ONE durable high-priority push notification for receiver device wakeup
+          // Strictly avoid sending incoming-call notification to caller
+          if (receiverId && String(receiverId) !== String(user.sub) && String(receiverId) !== String(user.id) && String(receiverId) !== String(user.customId)) {
+            try {
+              createAndDispatchNotification({
+                recipientId: receiverId,
+                eventId: `call_init_${callSession.callSessionId}`,
+                type: 'INCOMING_CALL',
+                priority: 'CRITICAL',
+                title: `Incoming call from ${user.name || 'HomeStepIn'}`,
+                body: `Calling regarding Booking #${booking.customId || booking.id}`,
+                bookingId: booking.customId || booking.id,
+                metadata: {
+                  callSessionId: callSession.callSessionId,
+                  callerId: user.sub,
+                  callerName: user.name || 'HomeStepIn',
+                  callerRole: user.role,
+                  bookingId: booking.customId || booking.id,
+                  type: 'INCOMING_CALL',
+                },
+              }).catch(err => console.warn('[WS Call Push] Dispatch warning:', err.message));
+            } catch (pushErr) {
+              console.warn('[WS Call Push] Failed to trigger notification:', pushErr.message);
+            }
+          }
+
           broadcastToRoom(booking.customId || booking.id, {
             type: 'call_ringing',
             callSessionId: callSession.callSessionId,
@@ -1013,6 +1103,11 @@ function setupWebSocketServer(httpServer) {
 
           const session = await CallSession.findOne({ callSessionId: data.callSessionId });
           if (!session) return;
+          // Idempotency: if already connected or terminated, do not re-broadcast
+          if (session.status === 'CALL_CONNECTED' || session.status === 'CALL_ENDED' || session.status === 'CALL_REJECTED') {
+            return;
+          }
+
           const booking = await findBookingById(session.bookingId);
           const myIds = [user.sub, user.id, user.customId].filter(Boolean).map(String);
           const isReceiver =
@@ -1024,7 +1119,6 @@ function setupWebSocketServer(httpServer) {
             ));
 
           if (isReceiver) {
-            const booking = await findBookingById(session.bookingId);
             if (isCommunicationDisabledForBooking(booking) && user.role !== 'admin') {
               session.status = 'CALL_ENDED';
               session.endedAt = new Date();
@@ -1045,6 +1139,20 @@ function setupWebSocketServer(httpServer) {
             session.status = 'CALL_CONNECTED';
             session.connectedAt = new Date();
             await session.save();
+            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=accept user=${user.sub}`);
+
+            // Suppress any remaining ringing push notification
+            NotificationOutbox.updateMany(
+              {
+                channel: 'PUSH',
+                $or: [
+                  { 'payload.metadata.callSessionId': session.callSessionId },
+                  { notificationId: `call_init_${session.callSessionId}` }
+                ],
+                status: { $in: ['PENDING', 'PROCESSING', 'FAILED'] },
+              },
+              { $set: { status: 'DEAD_LETTER', lastError: 'Call already connected/answered', nextRetryAt: null } }
+            ).catch(() => {});
 
             const connectedPayload = {
               type: 'call_connected',
@@ -1053,9 +1161,18 @@ function setupWebSocketServer(httpServer) {
               connectedAt: session.connectedAt.toISOString(),
             };
 
+            // Broadcast to booking room AND all participant user aliases to guarantee delivery
             broadcastToRoom(session.bookingId, connectedPayload);
-            broadcastToRoom(`user_${session.callerId}`, connectedPayload);
-            broadcastToRoom(`user_${session.receiverId}`, connectedPayload);
+            const participantIds = [
+              session.callerId,
+              session.receiverId,
+              booking?.customerId,
+              booking?.customer,
+              booking?.providerId,
+              booking?.worker,
+              booking?.provider,
+            ].filter(Boolean);
+            broadcastToUsers(participantIds, connectedPayload);
           }
           return;
         }
@@ -1081,8 +1198,16 @@ function setupWebSocketServer(httpServer) {
               sdp: data.sdp,
               senderId: user.sub,
             };
-            broadcastToRoom(`user_${targetId}`, offerPayload);
-            broadcastToRoom(session.bookingId, offerPayload, ws);
+            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=offer sender=${user.sub} target=${targetId}`);
+            const targetUser = await findUserByIdOrIdentifier(targetId);
+            const targetAliases = new Set([String(targetId)]);
+            if (targetUser) {
+              if (targetUser.sub) targetAliases.add(String(targetUser.sub));
+              if (targetUser.id) targetAliases.add(String(targetUser.id));
+              if (targetUser.customId) targetAliases.add(String(targetUser.customId));
+              if (targetUser._id) targetAliases.add(targetUser._id.toString());
+            }
+            broadcastToUsers(Array.from(targetAliases), offerPayload);
           }
           return;
         }
@@ -1108,8 +1233,16 @@ function setupWebSocketServer(httpServer) {
               sdp: data.sdp,
               senderId: user.sub,
             };
-            broadcastToRoom(`user_${targetId}`, answerPayload);
-            broadcastToRoom(session.bookingId, answerPayload, ws);
+            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=answer sender=${user.sub} target=${targetId}`);
+            const targetUser = await findUserByIdOrIdentifier(targetId);
+            const targetAliases = new Set([String(targetId)]);
+            if (targetUser) {
+              if (targetUser.sub) targetAliases.add(String(targetUser.sub));
+              if (targetUser.id) targetAliases.add(String(targetUser.id));
+              if (targetUser.customId) targetAliases.add(String(targetUser.customId));
+              if (targetUser._id) targetAliases.add(targetUser._id.toString());
+            }
+            broadcastToUsers(Array.from(targetAliases), answerPayload);
           }
           return;
         }
@@ -1135,8 +1268,16 @@ function setupWebSocketServer(httpServer) {
               candidate: data.candidate,
               senderId: user.sub,
             };
-            broadcastToRoom(`user_${targetId}`, candidatePayload);
-            broadcastToRoom(session.bookingId, candidatePayload, ws);
+            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=ice_candidate sender=${user.sub} target=${targetId}`);
+            const targetUser = await findUserByIdOrIdentifier(targetId);
+            const targetAliases = new Set([String(targetId)]);
+            if (targetUser) {
+              if (targetUser.sub) targetAliases.add(String(targetUser.sub));
+              if (targetUser.id) targetAliases.add(String(targetUser.id));
+              if (targetUser.customId) targetAliases.add(String(targetUser.customId));
+              if (targetUser._id) targetAliases.add(targetUser._id.toString());
+            }
+            broadcastToUsers(Array.from(targetAliases), candidatePayload);
           }
           return;
         }
@@ -1149,6 +1290,11 @@ function setupWebSocketServer(httpServer) {
           if (!user || !data.callSessionId) return;
 
           const session = await CallSession.findOne({ callSessionId: data.callSessionId });
+          if (!session) return;
+          // Idempotency: ignore duplicate call_end or call_reject if already terminated
+          if (session.status === 'CALL_ENDED' || session.status === 'CALL_REJECTED') {
+            return;
+          }
           const myIds = [user.sub, user.id, user.customId, user._id ? user._id.toString() : null].filter(Boolean).map(String);
           const isParticipant = session && (myIds.includes(String(session.callerId)) || myIds.includes(String(session.receiverId)) || user.role === 'admin');
 
@@ -1236,8 +1382,16 @@ function setupWebSocketServer(httpServer) {
       }
     });
 
-    ws.on('close', () => removeSocketFromAllRooms(ws));
-    ws.on('error', () => removeSocketFromAllRooms(ws));
+    ws.on('close', (code) => {
+      const uId = ws.user?.sub || ws.user?.id || ws.user?.customId || 'anonymous';
+      console.log(`[WS_DISCONNECT] userId=${uId} code=${code}`);
+      removeSocketFromAllRooms(ws);
+    });
+    ws.on('error', (err) => {
+      const uId = ws.user?.sub || ws.user?.id || ws.user?.customId || 'anonymous';
+      console.log(`[WS_DISCONNECT] userId=${uId} error=${err?.message || 'unknown'}`);
+      removeSocketFromAllRooms(ws);
+    });
   });
 
   const pingInterval = setInterval(() => {
@@ -1393,11 +1547,18 @@ async function processBackgroundJobs() {
   while (backgroundQueue.length > 0) {
     const job = backgroundQueue.shift();
     try {
-      // Async dispatch simulation (SMS, push gateway, audit records)
+      if (job.type === 'PUSH_NOTIFICATION') {
+        // Guarantee durable transaction-safe outbox processing executes real provider request
+        await processOutboxQueue();
+      } else if (job.type === 'AUDIT_LOG' && job.payload) {
+        await AuditLog.create(job.payload).catch(() => {});
+      }
     } catch (err) {
       if (job.retries < job.maxRetries) {
         job.retries += 1;
         backgroundQueue.push(job);
+      } else {
+        console.warn(`[Background Jobs] Job ${job.id} of type ${job.type} exceeded max retries:`, err.message);
       }
     }
   }
@@ -1535,6 +1696,8 @@ async function createAndDispatchNotification({
 const OUTBOX_WORKER_ID = `worker_${process.pid}_${crypto.randomBytes(3).toString('hex')}`;
 const OUTBOX_LOCK_TIMEOUT_MS = 60000; // 60s crash recovery timeout
 let isProcessingOutbox = false;
+let outboxNeedsAnotherPass = false;
+let activeProcessingPromise = null;
 
 // Automated reconciliation for notifications that might have diverged from outbox
 async function reconcileOutboxDiscrepancies() {
@@ -1590,11 +1753,18 @@ async function reconcileOutboxDiscrepancies() {
 }
 
 async function processOutboxQueue() {
-  if (isProcessingOutbox || mongoose.connection.readyState !== 1) return;
+  if (isProcessingOutbox) {
+    outboxNeedsAnotherPass = true;
+    return activeProcessingPromise;
+  }
+  if (mongoose.connection.readyState !== 1) return;
   isProcessingOutbox = true;
 
-  try {
-    const staleLockThreshold = new Date(Date.now() - OUTBOX_LOCK_TIMEOUT_MS);
+  activeProcessingPromise = (async () => {
+    try {
+      do {
+        outboxNeedsAnotherPass = false;
+        const staleLockThreshold = new Date(Date.now() - OUTBOX_LOCK_TIMEOUT_MS);
 
     // 1. Crash Recovery: Release locks for jobs stuck in PROCESSING longer than lock timeout
     await NotificationOutbox.updateMany(
@@ -1644,42 +1814,112 @@ async function processOutboxQueue() {
     // 3. Process claimed jobs with consumer idempotency and bounded backoff
     for (const job of claimedJobs) {
       try {
+        console.log(`[OUTBOX_ATTEMPT] notificationId=${job.notificationId} recipientId=${job.recipientId} channel=${job.channel} attempts=${job.attempts}`);
         // Consumer Idempotency Check: Verify notification exists
         const persistentNotif = await Notification.findOne({ notificationId: job.notificationId }).lean();
         if (!persistentNotif) {
           console.warn(`[Outbox Warning]: Notification ${job.notificationId} missing from collection.`);
         }
 
-        // Bounded provider dispatch timeout to prevent hanging locks
-        const dispatchPromise = new Promise((resolve) => setTimeout(resolve, 5));
-        await Promise.race([
-          dispatchPromise,
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Provider dispatch timed out (10s)')), 10000)),
-        ]);
-
-        // Complete delivery — Guarded by worker lease check to prevent duplicate completion if lock expired
-        const deliveryResult = await NotificationOutbox.updateOne(
-          { _id: job._id, lockedBy: OUTBOX_WORKER_ID, status: 'PROCESSING' },
-          {
-            $set: {
-              status: 'DELIVERED',
-              deliveredAt: new Date(),
-              lockedBy: null,
-              lockedAt: null,
-              lastError: null,
-            },
+        // Stale call check: do not push for calls that are no longer ringing
+        const callSessionId = job.payload?.metadata?.callSessionId;
+        if (job.type === 'INCOMING_CALL' || callSessionId) {
+          if (callSessionId) {
+            const callSession = await CallSession.findOne({ callSessionId }).lean();
+            if (!callSession || callSession.status !== 'CALL_RINGING') {
+              await NotificationOutbox.updateOne(
+                { _id: job._id, lockedBy: OUTBOX_WORKER_ID, status: 'PROCESSING' },
+                {
+                  $set: {
+                    status: 'DEAD_LETTER',
+                    lockedBy: null,
+                    lockedAt: null,
+                    lastError: `Call ${callSessionId} is stale or already ${callSession?.status || 'TERMINATED'}; push suppressed.`,
+                    nextRetryAt: null,
+                  },
+                }
+              );
+              continue;
+            }
           }
-        );
+        }
 
-        if (deliveryResult.matchedCount === 0) {
-          console.warn(`[Outbox Lease Expired]: Worker ${OUTBOX_WORKER_ID} lost lease on job ${job._id} before delivery completion.`);
+        // Provider dispatch via OneSignal REST API
+        if (job.channel === 'PUSH') {
+          const pushPayload = job.payload || {};
+          const recipientId = job.recipientId;
+          const notificationData = {
+            type: job.type,
+            notificationId: job.notificationId,
+            bookingId: pushPayload.bookingId ? String(pushPayload.bookingId) : null,
+            deepLink: pushPayload.deepLink || null,
+            ...(pushPayload.metadata || {}),
+          };
+
+          // Dynamically route push notification to Customer vs Partner OneSignal App based on recipient role
+          let appType = 'customer';
+          try {
+            const recipientUser = await findUserByIdOrIdentifier(recipientId);
+            if (recipientUser && (recipientUser.role === 'worker' || recipientUser.role === 'partner')) {
+              appType = 'partner';
+            }
+          } catch (_) {}
+
+          const dispatchPromise = oneSignalService.sendNotificationToUser(recipientId, {
+            title: pushPayload.title,
+            body: pushPayload.body,
+            data: notificationData,
+            sound: pushPayload.sound || 'default',
+          }, appType);
+
+          const dispatchResult = await Promise.race([
+            dispatchPromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('OneSignal provider dispatch timed out (10s)')), 10000)),
+          ]);
+
+          // Verification of Provider Acceptance:
+          // Must have success: true, a valid provider message id, and confirmed device recipients > 0
+          if (!dispatchResult || !dispatchResult.success || !dispatchResult.id || dispatchResult.recipients === 0) {
+            const failureReason = dispatchResult?.error || (dispatchResult?.recipients === 0 ? 'OneSignal provider matched 0 device recipients (unregistered or unmapped alias)' : (dispatchResult?.reason || 'OneSignal provider rejected request'));
+            const isPermanent = Boolean(dispatchResult?.isPermanent || dispatchResult?.skipped);
+            const err = new Error(failureReason);
+            err.isPermanent = isPermanent;
+            err.dispatchResult = dispatchResult;
+            throw err;
+          }
+
+          // Complete delivery ONLY upon confirmed provider acceptance WITH RECIPIENTS > 0
+          console.log(`[OUTBOX_RESULT] notificationId=${job.notificationId} status=DELIVERED providerMessageId=${dispatchResult.id} recipients=${dispatchResult.recipients}`);
+          const deliveryResult = await NotificationOutbox.updateOne(
+            { _id: job._id, lockedBy: OUTBOX_WORKER_ID, status: 'PROCESSING' },
+            {
+              $set: {
+                status: 'DELIVERED',
+                deliveredAt: new Date(),
+                providerMessageId: String(dispatchResult.id),
+                providerResponse: {
+                  id: dispatchResult.id,
+                  recipients: dispatchResult.recipients,
+                  targetedBy: dispatchResult.targetedBy || 'aliases',
+                },
+                lockedBy: null,
+                lockedAt: null,
+                lastError: null,
+              },
+            }
+          );
+
+          if (deliveryResult.matchedCount === 0) {
+            console.warn(`[Outbox Lease Expired]: Worker ${OUTBOX_WORKER_ID} lost lease on job ${job._id} before delivery completion.`);
+          }
         }
       } catch (dispatchErr) {
-        // Bounded retries and exponential backoff
         const attemptsMade = job.attempts;
         const maxAttempts = job.maxAttempts || 5;
+        const isPermanent = Boolean(dispatchErr.isPermanent || attemptsMade >= maxAttempts);
+        console.log(`[OUTBOX_RESULT] notificationId=${job.notificationId} status=${isPermanent ? 'DEAD_LETTER' : 'RETRY'} error="${dispatchErr.message}" attempts=${attemptsMade}`);
 
-        if (attemptsMade >= maxAttempts) {
+        if (isPermanent) {
           // Terminal failure -> DEAD_LETTER
           await NotificationOutbox.updateOne(
             { _id: job._id, lockedBy: OUTBOX_WORKER_ID },
@@ -1688,7 +1928,7 @@ async function processOutboxQueue() {
                 status: 'DEAD_LETTER',
                 lockedBy: null,
                 lockedAt: null,
-                lastError: `Terminal dead-letter failure after ${attemptsMade} attempts: ${dispatchErr.message}`,
+                lastError: `Terminal dead-letter failure (attempts: ${attemptsMade}): ${dispatchErr.message}`,
                 nextRetryAt: null,
               },
             }
@@ -1712,11 +1952,16 @@ async function processOutboxQueue() {
         }
       }
     }
-  } catch (err) {
+  } while (outboxNeedsAnotherPass);
+} catch (err) {
     console.error('[Outbox Queue Fatal Error]:', err.message);
   } finally {
     isProcessingOutbox = false;
+    activeProcessingPromise = null;
   }
+  })();
+
+  return activeProcessingPromise;
 }
 
 // Background poller for durable outbox recovery and periodic discrepancy reconciler
@@ -1772,9 +2017,22 @@ async function calculateAuthoritativePrice(serviceName, addOns = [], couponCode 
     }
   }
 
+  let convenienceFeeDefault = 49;
+  let freeDeliveryThreshold = 2000;
+  let taxRatePercent = 5;
+
+  try {
+    const settings = await PlatformSetting.findOne({ key: 'global_config' }).lean();
+    if (settings) {
+      if (typeof settings.convenienceFee === 'number') convenienceFeeDefault = settings.convenienceFee;
+      if (typeof settings.freeDeliveryThreshold === 'number') freeDeliveryThreshold = settings.freeDeliveryThreshold;
+      if (typeof settings.taxRatePercent === 'number') taxRatePercent = settings.taxRatePercent;
+    }
+  } catch (_) {}
+
   const subtotal = itemSubtotal + addOnsTotal;
-  const convenienceFee = subtotal >= 2000 ? 0 : 49;
-  const tax = Math.round(subtotal * 0.05); // 5% GST on home services
+  const convenienceFee = subtotal === 0 ? 0 : (subtotal >= freeDeliveryThreshold ? 0 : convenienceFeeDefault);
+  const tax = Math.round(subtotal * (taxRatePercent / 100)); // GST on home services
 
   let discount = 0;
   let appliedCoupon = null;
@@ -1794,20 +2052,76 @@ async function calculateAuthoritativePrice(serviceName, addOns = [], couponCode 
 
   const totalAmount = Math.max(0, subtotal + convenienceFee + tax - discount);
 
+  const itemizedRows = [
+    { key: 'item_total', label: 'Item Total', amount: subtotal, formattedAmount: `₹${subtotal}`, type: 'base' },
+  ];
+  if (convenienceFee > 0) {
+    itemizedRows.push({
+      key: 'convenience_fee',
+      label: 'Convenience & Safety Fee',
+      amount: convenienceFee,
+      formattedAmount: `₹${convenienceFee}`,
+      type: 'fee',
+      tooltip: 'Covers safety equipment, verified partner assurance & platform operations'
+    });
+  } else if (subtotal >= freeDeliveryThreshold && subtotal > 0) {
+    itemizedRows.push({
+      key: 'convenience_fee',
+      label: 'Convenience & Safety Fee',
+      amount: 0,
+      formattedAmount: 'FREE',
+      type: 'fee',
+      tooltip: `Waived for orders of ₹${freeDeliveryThreshold} and above`
+    });
+  }
+  if (tax > 0) {
+    itemizedRows.push({
+      key: 'taxes',
+      label: `Taxes & GST (${taxRatePercent}%)`,
+      amount: tax,
+      formattedAmount: `₹${tax}`,
+      type: 'tax',
+      tooltip: `${taxRatePercent}% GST on home services under Indian tax regulations`
+    });
+  }
+  if (discount > 0) {
+    itemizedRows.push({
+      key: 'discount',
+      label: `Coupon Discount (${appliedCoupon || 'PROMO'})`,
+      amount: -discount,
+      formattedAmount: `-₹${discount}`,
+      type: 'discount'
+    });
+  }
+  itemizedRows.push({
+    key: 'total',
+    label: 'Total Payable',
+    amount: totalAmount,
+    formattedAmount: `₹${totalAmount}`,
+    type: 'total'
+  });
+
   return {
     serviceName: serviceDisplayName || serviceName,
     basePrice,
     quantity: qty,
     itemSubtotal,
     addOns: validatedAddOns,
+    addOnsTotal,
     subtotal,
     convenienceFee,
+    convenienceFeeLabel: 'Convenience & Safety Fee',
+    isConvenienceFeeWaived: convenienceFee === 0 && subtotal > 0,
+    convenienceFeeThreshold: freeDeliveryThreshold,
+    taxRatePercent,
     tax,
+    taxLabel: `Taxes & GST (${taxRatePercent}%)`,
     discount,
     couponCode: appliedCoupon,
     additionalApprovedWork: 0,
     totalAmount,
     currency: 'INR',
+    itemizedRows,
     calculatedAt: new Date().toISOString(),
   };
 }
@@ -1925,6 +2239,48 @@ async function authRequired(req, res, next) {
     return next(dbErr);
   }
 }
+
+async function optionalAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.auth = payload;
+  } catch (_) {}
+  next();
+}
+
+// Authoritative Price Calculation Endpoint (Public & Authenticated)
+app.post(['/api/bookings/calculate-price', '/api/pricing/calculate'], optionalAuth, async (req, res) => {
+  try {
+    const { service, serviceName, serviceId, quantity = 1, addOns = [], couponCode = null, cartItems = [] } = req.body;
+    const effectiveService = service || serviceName || serviceId || (cartItems && cartItems[0] ? (cartItems[0].serviceName || cartItems[0].name) : 'AC Service & Repair');
+    const customerId = req.auth?.sub || null;
+
+    const priceBreakdown = await calculateAuthoritativePrice(
+      effectiveService,
+      addOns,
+      couponCode,
+      quantity,
+      cartItems,
+      customerId
+    );
+
+    return res.status(200).json({
+      success: true,
+      priceBreakdown,
+      ...priceBreakdown,
+    });
+  } catch (err) {
+    console.error('[Calculate Price Error]:', err.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Unable to calculate price breakdown.',
+      code: 'PRICE_CALC_FAILED',
+    });
+  }
+});
 
 function requireRoles(...allowedRoles) {
   return (req, res, next) => {
@@ -3150,6 +3506,13 @@ app.post('/api/auth/verify-customer-otp', authRateLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new one.', code: 'INVALID_OTP' });
     }
 
+    if (!user.emailVerified) {
+      return res.status(400).json({
+        error: 'Password reset is only permitted for verified accounts. Please verify your email first.',
+        code: 'EMAIL_NOT_VERIFIED',
+      });
+    }
+
     if (user.emailVerified) {
       return res.status(400).json({ error: 'This email is already verified. You can sign in now.', code: 'ALREADY_VERIFIED' });
     }
@@ -3205,74 +3568,96 @@ app.post(['/api/auth/register-worker', '/api/auth/register-provider'], authRateL
   });
 });
 
-// Forgot Password Recovery Request (Email OTP — Customer & Worker supported)
+// Forgot Password Recovery Request (Zero-Knowledge Anti-Enumeration — Customer & Worker supported)
 app.post('/api/auth/forgot-password', authRateLimiter, async (req, res) => {
   try {
-    const identifier = req.body.email || req.body.identifier;
-    if (!identifier || typeof identifier !== 'string' || !identifier.trim()) {
-      return res.status(400).json({ error: 'Please enter your registered email address.' });
+    const rawIdentifier = req.body.email || req.body.identifier;
+    if (!rawIdentifier || typeof rawIdentifier !== 'string' || !rawIdentifier.trim()) {
+      return res.status(400).json({ error: 'Please enter your registered email address or Customer ID.' });
     }
 
-    const cleanEmail = identifier.trim().toLowerCase();
-    const user = await User.findOne({ email: cleanEmail }).select('+otp.codeHash');
+    // Zero-Knowledge Uniform Response: identical payload regardless of account existence, status, or role
+    const uniformResponse = {
+      success: true,
+      message: 'If an account matching this identifier exists and is verified, a 6-digit password reset code has been sent to the registered email address.',
+      expiresInSeconds: 300,
+      resendCooldownSeconds: 60,
+    };
 
+    const cleanInput = rawIdentifier.trim();
+    let query;
+    if (cleanInput.includes('@')) {
+      query = { email: cleanInput.toLowerCase() };
+    } else {
+      query = {
+        $or: [
+          { customId: cleanInput.toUpperCase() },
+          { customId: cleanInput },
+          { phone: cleanInput },
+        ],
+      };
+    }
+
+    const user = await User.findOne(query).select('+otp.codeHash');
+
+    // Security Gate 1: Non-existent account -> Return uniform response without generating OTP or sending email
     if (!user) {
-      // Anti-enumeration: same generic success response
-      return res.status(200).json({
-        success: true,
-        requiresOtp: true,
-        message: 'If an account with this email exists, a password reset code has been sent.',
-        expiresInSeconds: 300,
-        resendCooldownSeconds: 60,
-      });
+      return res.status(200).json(uniformResponse);
     }
 
+    // Security Gate 2: Worker accounts cannot be recovered via Customer endpoint (strict account isolation)
+    if (user.role === 'worker' || (user.role !== 'customer' && user.role !== 'admin')) {
+      return res.status(200).json(uniformResponse);
+    }
+
+    // Security Gate 3: Unverified accounts cannot reset password (must verify email first)
+    if (!user.emailVerified) {
+      console.log(`[Forgot Password] Refusing reset OTP for unverified account: ${user.email}`);
+      return res.status(200).json(uniformResponse);
+    }
+
+    // Security Gate 4: Suspended or disabled accounts
     if (user.status === 'disabled' || user.status === 'suspended') {
-      return res.status(403).json({
-        error: 'Your account has been deactivated or suspended. Please contact support.',
-        code: 'ACCOUNT_DISABLED',
-      });
+      return res.status(200).json(uniformResponse);
     }
 
-    // Check resend cooldown
+    // Security Gate 5: Resend cooldown check
     const resendCheck = canResend(user);
     if (!resendCheck.canResend) {
-      return res.status(429).json({
-        success: false,
-        error: `Please wait ${resendCheck.secondsRemaining} seconds before requesting another reset code.`,
-        code: 'RESEND_COOLDOWN_ACTIVE',
+      // Return uniform response with the actual remaining cooldown seconds so the client UI timer stays accurate
+      return res.status(200).json({
+        ...uniformResponse,
         resendCooldownSeconds: resendCheck.secondsRemaining,
       });
     }
 
-    const isWorker = user.role === 'worker';
-    const otpPurpose = isWorker ? 'worker_password_reset' : 'password_reset';
-    const plainOtp = await createOtpForUser(user, otpPurpose);
+    // Strict Delivery Rule: Send ONLY to verified email registered in MongoDB
+    const targetEmail = user.email.toLowerCase();
+    const plainOtp = await createOtpForUser(user, 'password_reset');
 
     try {
-      if (isWorker) {
-        await resendService.sendWorkerPasswordResetOtp({ to: cleanEmail, otp: plainOtp });
-      } else {
-        await resendService.sendCustomerPasswordResetOtp({ to: cleanEmail, otp: plainOtp });
-      }
+      await resendService.sendCustomerPasswordResetOtp({ to: targetEmail, otp: plainOtp });
     } catch (emailErr) {
-      console.warn('[Forgot Password OTP Resend Warning]:', emailErr.message);
+      console.error('[Forgot Password Email Delivery Failed]:', emailErr.message);
+      try {
+        user.otp = undefined;
+        await user.save();
+      } catch (_) {}
+      return res.status(502).json({
+        success: false,
+        error: 'Unable to deliver verification email at this time. Please try again shortly.',
+        code: 'EMAIL_DELIVERY_FAILED',
+      });
     }
 
-    return res.status(200).json({
-      success: true,
-      requiresOtp: true,
-      message: 'If an account with this email exists, a password reset code has been sent.',
-      expiresInSeconds: 300,
-      resendCooldownSeconds: 60,
-    });
+    return res.status(200).json(uniformResponse);
   } catch (err) {
     console.error('[Forgot Password Error]:', err.message);
     return res.status(500).json({ error: 'Unable to process your request. Please try again.' });
   }
 });
 
-// Dedicated Worker Forgot Password Request (Resend Six-Digit OTP)
+// Dedicated Worker Forgot Password Request (Zero-Knowledge Anti-Enumeration — Resend Six-Digit OTP)
 app.post('/api/auth/worker/forgot-password', authRateLimiter, async (req, res) => {
   try {
     const identifier = req.body.email || req.body.identifier;
@@ -3280,33 +3665,35 @@ app.post('/api/auth/worker/forgot-password', authRateLimiter, async (req, res) =
       return res.status(400).json({ error: 'Please enter your registered partner email address.' });
     }
 
+    const uniformResponse = {
+      success: true,
+      message: 'If a partner account with this email exists and is verified, a password reset code has been sent.',
+      expiresInSeconds: 300,
+      resendCooldownSeconds: 60,
+    };
+
     const cleanEmail = identifier.trim().toLowerCase();
     const user = await User.findOne({ email: cleanEmail, role: 'worker' }).select('+otp.codeHash');
 
     // Anti-enumeration: generic success response
     if (!user) {
-      return res.status(200).json({
-        success: true,
-        requiresOtp: true,
-        message: 'If a partner account with this email exists, a password reset code has been sent.',
-        expiresInSeconds: 300,
-        resendCooldownSeconds: 60,
-      });
+      return res.status(200).json(uniformResponse);
+    }
+
+    // Registered but unverified partner email -> DO NOT send password reset OTP
+    if (!user.emailVerified) {
+      console.log(`[Worker Forgot Password] Refusing reset OTP for unverified partner account: ${cleanEmail}`);
+      return res.status(200).json(uniformResponse);
     }
 
     if (user.status === 'disabled' || user.status === 'suspended') {
-      return res.status(403).json({
-        error: 'This partner account is inactive or suspended. Please contact operations support.',
-        code: 'ACCOUNT_DISABLED',
-      });
+      return res.status(200).json(uniformResponse);
     }
 
     const resendCheck = canResend(user);
     if (!resendCheck.canResend) {
-      return res.status(429).json({
-        success: false,
-        error: `Please wait ${resendCheck.secondsRemaining} seconds before requesting another reset code.`,
-        code: 'RESEND_COOLDOWN_ACTIVE',
+      return res.status(200).json({
+        ...uniformResponse,
         resendCooldownSeconds: resendCheck.secondsRemaining,
       });
     }
@@ -3315,16 +3702,19 @@ app.post('/api/auth/worker/forgot-password', authRateLimiter, async (req, res) =
     try {
       await resendService.sendWorkerPasswordResetOtp({ to: cleanEmail, otp: plainOtp });
     } catch (emailErr) {
-      console.warn('[Worker Forgot Password Resend Warning]:', emailErr.message);
+      console.error('[Worker Forgot Password Email Delivery Failed]:', emailErr.message);
+      try {
+        user.otp = undefined;
+        await user.save();
+      } catch (_) {}
+      return res.status(502).json({
+        success: false,
+        error: 'Unable to deliver partner verification email at this time. Please try again shortly.',
+        code: 'EMAIL_DELIVERY_FAILED',
+      });
     }
 
-    return res.status(200).json({
-      success: true,
-      requiresOtp: true,
-      message: 'If a partner account with this email exists, a password reset code has been sent.',
-      expiresInSeconds: 300,
-      resendCooldownSeconds: 60,
-    });
+    return res.status(200).json(uniformResponse);
   } catch (err) {
     console.error('[Worker Forgot Password Error]:', err.message);
     return res.status(500).json({ error: 'Unable to process your request. Please try again.' });
@@ -3334,6 +3724,13 @@ app.post('/api/auth/worker/forgot-password', authRateLimiter, async (req, res) =
 // Dedicated Worker Verify Reset OTP & Update Password
 app.post(['/api/auth/worker/verify-reset-otp', '/api/auth/worker/reset-password'], authRateLimiter, async (req, res) => {
   try {
+    if (req.body.firebaseIdToken || req.body.idToken) {
+      return res.status(400).json({
+        error: 'Firebase password reset is deprecated and removed. Please use the 6-digit verification code sent to your email.',
+        code: 'FIREBASE_RESET_DEPRECATED',
+      });
+    }
+
     const { email, identifier, otp, newPassword, confirmPassword } = req.body;
     const targetEmail = email || identifier;
 
@@ -3360,6 +3757,13 @@ app.post(['/api/auth/worker/verify-reset-otp', '/api/auth/worker/reset-password'
 
     if (!user) {
       return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new one.', code: 'INVALID_OTP' });
+    }
+
+    if (!user.emailVerified) {
+      return res.status(400).json({
+        error: 'Password reset is only permitted for verified accounts. Please verify your email first.',
+        code: 'EMAIL_NOT_VERIFIED',
+      });
     }
 
     if (user.status === 'disabled' || user.status === 'suspended') {
@@ -3399,6 +3803,13 @@ app.post(['/api/auth/worker/verify-reset-otp', '/api/auth/worker/reset-password'
 // Verify Password Reset OTP and set new password
 app.post(['/api/auth/verify-reset-otp', '/api/auth/reset-password'], authRateLimiter, async (req, res) => {
   try {
+    if (req.body.firebaseIdToken || req.body.idToken) {
+      return res.status(400).json({
+        error: 'Firebase password reset is deprecated and removed. Please use the 6-digit verification code sent to your email.',
+        code: 'FIREBASE_RESET_DEPRECATED',
+      });
+    }
+
     const { email, identifier, otp, newPassword, confirmPassword } = req.body;
     const targetEmail = email || identifier;
 
@@ -3422,17 +3833,38 @@ app.post(['/api/auth/verify-reset-otp', '/api/auth/reset-password'], authRateLim
       return res.status(400).json({ error: 'Passwords do not match.', code: 'PASSWORD_MISMATCH' });
     }
 
-    const user = await User.findOne({ email: normalizedEmail, role: { $in: ['customer', 'worker'] } }).select('+otp.codeHash +passwordHash +refreshTokens');
+    let userQuery;
+    if (normalizedEmail.includes('@')) {
+      userQuery = { email: normalizedEmail, role: { $in: ['customer', 'admin'] } };
+    } else {
+      userQuery = {
+        $or: [
+          { customId: normalizedEmail.toUpperCase() },
+          { customId: normalizedEmail },
+          { phone: normalizedEmail },
+        ],
+        role: { $in: ['customer', 'admin'] },
+      };
+    }
+
+    const user = await User.findOne(userQuery).select('+otp.codeHash +passwordHash +refreshTokens');
 
     if (!user) {
       return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new one.', code: 'INVALID_OTP' });
+    }
+
+    if (!user.emailVerified) {
+      return res.status(400).json({
+        error: 'Password reset is only permitted for verified accounts. Please verify your email first.',
+        code: 'EMAIL_NOT_VERIFIED',
+      });
     }
 
     if (user.status === 'disabled' || user.status === 'suspended') {
       return res.status(403).json({ error: 'Your account is deactivated or suspended. Please contact support.', code: 'ACCOUNT_DISABLED' });
     }
 
-    const otpPurpose = user.role === 'worker' ? 'worker_password_reset' : 'password_reset';
+    const otpPurpose = 'password_reset';
     const result = await verifyOtpForUser(user, cleanOtp, otpPurpose);
 
     if (!result.success) {
@@ -5450,6 +5882,19 @@ app.post('/api/payments/verify', authRequired, requireRoles('customer', 'admin')
             bookingId: targetBooking.customId || targetBooking.id,
           });
         }
+
+        const customerRecipientId = targetBooking.customerId || (targetBooking.customer ? String(targetBooking.customer) : '');
+        if (customerRecipientId) {
+          await createAndDispatchNotification({
+            recipientId: customerRecipientId,
+            eventId: `evt_pay_cust_${paymentId}`,
+            type: 'PAYMENT_SUCCESS',
+            priority: 'IMPORTANT',
+            title: 'Payment Successful',
+            body: `Your payment of ₹${paymentRecord?.amount || targetBooking.priceNum} for Booking #${targetBooking.customId || targetBooking.id} was successful.`,
+            bookingId: targetBooking.customId || targetBooking.id,
+          }).catch(e => console.warn('[Payment Success Push] Warning:', e.message));
+        }
       }
     }
 
@@ -5637,6 +6082,18 @@ app.post('/api/payments/webhook', async (req, res) => {
           if (booking && booking.paymentStatus === 'PENDING') {
             booking.paymentStatus = 'FAILED';
             await booking.save();
+          }
+
+          if (booking && (booking.customerId || booking.customer)) {
+            await createAndDispatchNotification({
+              recipientId: booking.customerId || booking.customer,
+              eventId: `evt_pay_fail_${paymentEntity.id || orderId}`,
+              type: 'PAYMENT_FAILED',
+              priority: 'IMPORTANT',
+              title: 'Payment Failed',
+              body: `Payment for Booking #${booking.customId || booking.id} failed. Please retry your payment.`,
+              bookingId: booking.customId || booking.id,
+            }).catch(e => console.warn('[Payment Failed Push] Warning:', e.message));
           }
         }
       }
@@ -6274,13 +6731,28 @@ async function handleCreateBooking(req, res) {
   const candidateBatch = eligibleWorkers;
 
   if (candidateBatch.length > 0) {
-    const notifBatch = candidateBatch.map(({ worker, distanceKm }) => {
-      const workerIdStr = worker._id.toString();
+    const notifBatch = [];
+    const outboxBatch = [];
+
+    for (const item of candidateBatch) {
+      // Robust resolution of nested worker document from { worker, distanceKm } or worker directly
+      const workerDoc = item.worker || item;
+      const distanceKm = typeof item.distanceKm === 'number' ? item.distanceKm : 0;
+      const workerIdStr = workerDoc._id ? workerDoc._id.toString() : (workerDoc.customId || workerDoc.id);
+
+      if (!workerIdStr) {
+        console.warn('[Dispatch Warning] Skipping eligible worker candidate: missing valid worker ID');
+        continue;
+      }
+
       const formattedDistance = distanceKm > 0 ? `${distanceKm} km` : 'Near you';
-      return {
-        notificationId: `notif_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+      const notificationId = `notif_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const eventId = `evt_offer_${newBooking.customId}_${workerIdStr}`;
+
+      notifBatch.push({
+        notificationId,
         recipientId: workerIdStr,
-        eventId: `evt_offer_${newBooking.customId}_${workerIdStr}`,
+        eventId,
         type: 'NEW_JOB_OFFER',
         priority: 'CRITICAL',
         title: 'New Service Request Available',
@@ -6288,15 +6760,68 @@ async function handleCreateBooking(req, res) {
         bookingId: newBooking.customId,
         deepLink: `homestepin://bookings/${newBooking.customId}`,
         read: false,
-      };
-    });
+      });
 
-    await Notification.insertMany(notifBatch, { ordered: false }).catch(() => {});
+      outboxBatch.push({
+        outboxId: `ob_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+        notificationId,
+        recipientId: workerIdStr,
+        type: 'NEW_JOB_OFFER',
+        channel: 'PUSH',
+        payload: {
+          title: 'New Service Request Available',
+          body: `New ${newBooking.service} job in ${newBooking.area || newBooking.city} (${formattedDistance}).`,
+          deepLink: `homestepin://bookings/${newBooking.customId}`,
+          bookingId: newBooking.customId,
+          metadata: {
+            type: 'NEW_JOB_OFFER',
+            service: newBooking.service,
+            category: newBooking.category,
+            bookingId: newBooking.customId,
+            distance: formattedDistance,
+            workerCustomId: workerDoc.customId || null,
+            workerMongoId: workerDoc._id ? workerDoc._id.toString() : null,
+          },
+          sound: 'homestepin_notification.wav',
+          android: {
+            channelId: 'homestepin_jobs_v2',
+            sound: 'homestepin_notification',
+          },
+        },
+        status: 'PENDING',
+      });
+    }
+
+    if (notifBatch.length > 0) {
+      await Notification.insertMany(notifBatch, { ordered: false }).catch(() => {});
+    }
+
+    if (outboxBatch.length > 0) {
+      // Idempotent insertion of durable outbox records
+      for (const ob of outboxBatch) {
+        try {
+          const existingOutbox = await NotificationOutbox.findOne({
+            recipientId: ob.recipientId,
+            type: 'NEW_JOB_OFFER',
+            'payload.bookingId': newBooking.customId,
+          }).lean();
+          if (!existingOutbox) {
+            await NotificationOutbox.create(ob);
+          }
+        } catch (e) {
+          console.warn('[Outbox Create Warning] Could not insert outbox record for worker:', e.message);
+        }
+      }
+    }
 
     // Offload real-time socket broadcasting to next event tick
     setImmediate(() => {
-      for (const { worker, distanceKm } of candidateBatch) {
-        const workerIdStr = worker._id.toString();
+      for (const item of candidateBatch) {
+        const worker = item.worker || item;
+        const distanceKm = typeof item.distanceKm === 'number' ? item.distanceKm : 0;
+        const workerIdStr = worker._id ? worker._id.toString() : (worker.customId || worker.id);
+        if (!workerIdStr) continue;
+
         const workerRoom = `user_${workerIdStr}`;
         const formattedDistance = distanceKm > 0 ? `${distanceKm} km` : 'Near you';
 
@@ -6357,6 +6882,21 @@ async function handleCreateBooking(req, res) {
     type: 'NEW_JOB_AVAILABLE',
     booking: formatWorkerJob(newBooking, null),
   });
+
+  // Dispatch background push notification to eligible workers via OneSignal
+  if (eligibleWorkers && eligibleWorkers.length > 0) {
+    const workerTargetIds = eligibleWorkers
+      .map(item => {
+        const wDoc = item.worker || item;
+        return wDoc.customId || (wDoc._id ? wDoc._id.toString() : null) || wDoc.id;
+      })
+      .filter(Boolean);
+    if (workerTargetIds.length > 0) {
+      oneSignalService
+        .notifyJobOfferToWorkers(workerTargetIds, newBooking)
+        .catch(err => console.warn('[OneSignal Job Dispatch Warning]:', err.message));
+    }
+  }
 
   broadcastToAdmins({
     type: 'NEW_BOOKING_CREATED',
@@ -8393,46 +8933,11 @@ app.patch('/api/worker/availability', authRequired, requireRoles('worker'), asyn
   return res.json({ success: true, online: worker.online });
 });
 
-// 1.1 Worker Push Token Registration
-app.post(['/api/worker/push-token', '/api/notifications/register-token'], authRequired, async (req, res) => {
-  const { token, platform = 'android', deviceId } = req.body || {};
-  if (!token || typeof token !== 'string') {
-    return res.status(400).json({ error: 'Push token string is required.' });
-  }
-
-  const user = await findUserByIdOrIdentifier(req.auth.sub);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-
-  if (!user.fcmTokens) user.fcmTokens = [];
-
-  // Remove duplicate if already exists
-  user.fcmTokens = user.fcmTokens.filter(t => t.token !== token);
-
-  // Add updated token entry
-  user.fcmTokens.push({
-    token: token.trim(),
-    platform: ['android', 'ios', 'web'].includes(platform) ? platform : 'android',
-    deviceId: deviceId || `${platform}_${user.customId || user._id}`,
-    lastSeenAt: new Date(),
-  });
-
-  await user.save();
-  return res.json({ success: true, message: 'Push token registered successfully.', tokenCount: user.fcmTokens.length });
-});
+// 1.1 Worker Push Token Registration (delegated to unified multi-device OneSignal & FCM handler)
+app.post(['/api/worker/push-token', '/api/notifications/register-token'], authRequired, handleRegisterPushToken);
 
 // 1.2 Worker Push Token Unregistration (Logout / Disable)
-app.delete('/api/worker/push-token', authRequired, async (req, res) => {
-  const { token } = req.body || {};
-  const user = await findUserByIdOrIdentifier(req.auth.sub);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-
-  if (user.fcmTokens && token) {
-    user.fcmTokens = user.fcmTokens.filter(t => t.token !== token.trim());
-    await user.save();
-  }
-
-  return res.json({ success: true, message: 'Push token unregistered.' });
-});
+app.delete('/api/worker/push-token', authRequired, handleDeregisterPushToken);
 
 // 1.3 User Logout with Device Cleanup
 app.post('/api/auth/logout', authRequired, async (req, res) => {
@@ -9288,7 +9793,7 @@ function resolveWebRtcIceServers(user) {
 }
 
 // 3. Initiate In-App Call
-app.post('/api/bookings/:id/call/initiate', authRequired, async (req, res) => {
+app.post(['/api/bookings/:id/call', '/api/bookings/:id/call/initiate'], authRequired, async (req, res) => {
   const booking = await findBookingById(req.params.id);
   if (!booking) return res.status(404).json({ error: 'Booking not found.' });
 
@@ -9357,9 +9862,28 @@ app.post('/api/bookings/:id/call/initiate', authRequired, async (req, res) => {
     },
   };
 
-  broadcastToRoom(`user_${receiverId}`, incomingPayload);
-  if (receiverAltId && receiverAltId !== receiverId) {
-    broadcastToRoom(`user_${receiverAltId}`, incomingPayload);
+  broadcastToUsers([receiverId, receiverAltId].filter(Boolean), incomingPayload);
+
+  // Push notification for incoming call (high-priority alert to wake recipient device)
+  try {
+    await createAndDispatchNotification({
+      recipientId: receiverId,
+      eventId: `call_init_${callSession.callSessionId}`,
+      type: 'INCOMING_CALL',
+      priority: 'CRITICAL',
+      title: `Incoming call from ${req.auth.name || 'HomeStepIn'}`,
+      body: `Calling regarding Booking #${booking.customId || booking.id}`,
+      bookingId: booking.customId || booking.id,
+      metadata: {
+        callSessionId: callSession.callSessionId,
+        callerId: req.auth.sub,
+        callerName: req.auth.name || 'HomeStepIn',
+        callerRole: req.auth.role,
+        bookingId: booking.customId || booking.id,
+      },
+    });
+  } catch (err) {
+    console.warn('[Call Push] Failed to trigger notification:', err.message);
   }
 
   broadcastToRoom(booking.customId || booking.id, {
@@ -9412,6 +9936,19 @@ app.post('/api/bookings/:id/call/:callSessionId/accept', authRequired, async (re
   session.connectedAt = new Date();
   await session.save();
 
+  // Suppress any remaining ringing push notification for this call
+  NotificationOutbox.updateMany(
+    {
+      channel: 'PUSH',
+      $or: [
+        { 'payload.metadata.callSessionId': session.callSessionId },
+        { notificationId: `call_init_${session.callSessionId}` }
+      ],
+      status: { $in: ['PENDING', 'PROCESSING', 'FAILED'] },
+    },
+    { $set: { status: 'DEAD_LETTER', lastError: 'Call already connected/accepted', nextRetryAt: null } }
+  ).catch(() => {});
+
   const connectedPayload = {
     type: 'call_connected',
     callSessionId: session.callSessionId,
@@ -9457,6 +9994,19 @@ app.post('/api/bookings/:id/call/:callSessionId/end', authRequired, async (req, 
   session.durationSeconds = duration;
   session.endReason = reason || (isReject ? 'declined' : 'normal');
   await session.save();
+
+  // Suppress any remaining ringing push notification for this call
+  NotificationOutbox.updateMany(
+    {
+      channel: 'PUSH',
+      $or: [
+        { 'payload.metadata.callSessionId': session.callSessionId },
+        { notificationId: `call_init_${session.callSessionId}` }
+      ],
+      status: { $in: ['PENDING', 'PROCESSING', 'FAILED'] },
+    },
+    { $set: { status: 'DEAD_LETTER', lastError: `Call already ${session.status}`, nextRetryAt: null } }
+  ).catch(() => {});
 
   const endPayload = {
     type: 'call_ended',
@@ -9612,10 +10162,23 @@ async function handleDeregisterPushToken(req, res) {
 }
 
 app.delete('/api/notifications/push-token', authRequired, handleDeregisterPushToken);
+app.delete('/api/worker/push-token', authRequired, handleDeregisterPushToken);
+app.delete('/api/notifications/deregister-token', authRequired, handleDeregisterPushToken);
 app.delete('/api/notifications/fcm-token', authRequired, handleDeregisterPushToken);
 app.post('/api/notifications/fcm-token/deregister', authRequired, handleDeregisterPushToken);
 app.delete('/api/auth/fcm-token', authRequired, handleDeregisterPushToken);
 app.post('/api/notifications/unregister-device', authRequired, handleDeregisterPushToken);
+
+// Public notification configuration endpoint (OneSignal App ID discovery)
+app.get('/api/notifications/public-config', (req, res) => {
+  const role = String(req.query.role || req.query.type || '').toLowerCase();
+  const isWorker = role === 'worker' || role === 'partner';
+  res.json({
+    oneSignalAppId: isWorker
+      ? (config.oneSignalPartnerAppId || process.env.ONESIGNAL_PARTNER_APP_ID || '3ad71bb0-508d-4b7d-a09f-64754400c57b')
+      : (config.oneSignalAppId || process.env.ONESIGNAL_APP_ID || '28d1903d-40bf-4e76-9e0a-b2b005df2aae'),
+  });
+});
 
 // Get User Notifications (Paginated, Filterable & Strict User Scoped)
 app.get('/api/notifications', authRequired, async (req, res) => {
@@ -13684,4 +14247,4 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, server, startServer, handleGracefulShutdown, setupWebSocketServer };
+module.exports = { app, server, startServer, handleGracefulShutdown, setupWebSocketServer, calculateAuthoritativePrice, processOutboxQueue };

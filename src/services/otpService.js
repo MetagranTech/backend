@@ -391,21 +391,40 @@ async function verifyOtpForUser(user, plainOtp, expectedPurpose) {
   const isMatch = await verifyOtpHash(plainOtp, otp.codeHash);
 
   if (!isMatch) {
-    otp.attempts = currentAttempts + 1;
-    await user.save();
-    const attemptsRemaining = MAX_VERIFICATION_ATTEMPTS - otp.attempts;
+    // Atomically increment attempts to prevent race condition brute-force attacks
+    const updated = await user.constructor.findOneAndUpdate(
+      { _id: user._id, 'otp.codeHash': otp.codeHash },
+      { $inc: { 'otp.attempts': 1 } },
+      { new: true }
+    );
+    const newAttempts = (updated && updated.otp && updated.otp.attempts) || (currentAttempts + 1);
+    otp.attempts = newAttempts;
+    const attemptsRemaining = Math.max(0, MAX_VERIFICATION_ATTEMPTS - newAttempts);
     if (attemptsRemaining <= 0) {
       return { success: false, error: 'Too many incorrect attempts. Please request a new code.', attemptsRemaining: 0 };
     }
     return { success: false, error: `Incorrect verification code. ${attemptsRemaining} attempt${attemptsRemaining === 1 ? '' : 's'} remaining.`, attemptsRemaining };
   }
 
-  // Success — clear the OTP immediately (replay prevention)
-  user.otp = {
+  // Success — atomically consume and invalidate the OTP immediately (atomic single-use replay prevention)
+  const consumed = await user.constructor.findOneAndUpdate(
+    { _id: user._id, 'otp.codeHash': otp.codeHash, 'otp.attempts': { $lt: MAX_VERIFICATION_ATTEMPTS } },
+    {
+      $unset: { 'otp.codeHash': 1, 'otp.expiresAt': 1, 'otp.purpose': 1, 'otp.resendCooldownExpires': 1 },
+      $set: { 'otp.attempts': MAX_VERIFICATION_ATTEMPTS },
+    },
+    { new: true }
+  );
+
+  if (!consumed) {
+    return { success: false, error: 'Verification code has already been used or expired.' };
+  }
+
+  user.otp = consumed.otp || {
     codeHash: undefined,
     expiresAt: undefined,
     purpose: undefined,
-    attempts: 0,
+    attempts: MAX_VERIFICATION_ATTEMPTS,
     resendCooldownExpires: undefined,
     resendCount: 0,
   };
