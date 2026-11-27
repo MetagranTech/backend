@@ -14193,7 +14193,7 @@ async function startServer() {
     assertProductionSafety();
     console.log('[HomeStepIn Backend] Initializing database connection...');
     await connectDb();
-    await connectFinanceDb().catch(err => console.warn("[Finance MongoDB Startup Warning]:", err.message));
+    await connectFinanceDb().catch(err => console.error("[Finance MongoDB Startup Error]:", err.message));
     setInterval(() => { financeService.processFinanceOutbox().catch(() => {}); }, 30000).unref();
     await User.init().catch(err => console.warn('[User Index Init Warning]:', err.message));
     await bootstrapDefaultTrichyArea().catch(err => console.warn('[ServiceArea Bootstrap Warning]:', err.message));
