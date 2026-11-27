@@ -65,15 +65,26 @@ function csv(name, fallback = '') {
     .filter(Boolean);
 }
 
+function normalizePrivateKey(rawValue) {
+  let key = String(rawValue || '').trim();
+  if (
+    (key.startsWith('"') && key.endsWith('"')) ||
+    (key.startsWith("'") && key.endsWith("'"))
+  ) {
+    key = key.slice(1, -1).trim();
+  }
+  return key.replace(/\\n/g, '\n').trim();
+}
+
 module.exports = {
   port: Number(process.env.PORT || 4001),
   mongoUri: required('MONGODB_URI', 'mongodb://127.0.0.1:27017/homestepin'),
+  financeMongoUri: sanitizeMongoUri(process.env.FINANCE_MONGODB_URI || process.env.MONGO_FINANCE_URI || ''),
   jwtAccessSecret: required('JWT_ACCESS_SECRET', 'dev-access-secret-change', 32),
   jwtRefreshSecret: required('JWT_REFRESH_SECRET', 'dev-refresh-secret-change', 32),
   jwtAccessTtl: process.env.JWT_ACCESS_TTL || '15m',
   jwtRefreshTtl: process.env.JWT_REFRESH_TTL || '14d',
   paymentWebhookSecret: required('PAYMENT_WEBHOOK_SECRET', 'dev-payment-webhook-secret', 16),
-  razorpayWebhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || process.env.PAYMENT_WEBHOOK_SECRET || 'dev-payment-webhook-secret',
   // Initial admin bootstrapping is optional in production.
   // When omitted or set to development defaults, existing admin accounts in MongoDB are preserved and startup succeeds normally.
   adminBootstrapEmail: (() => {
@@ -113,10 +124,8 @@ module.exports = {
   corsOrigins: isProduction
     ? csv('CORS_ALLOWED_ORIGINS', required('CORS_ALLOWED_ORIGINS'))
     : csv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4001,http://127.0.0.1:4001,http://localhost:8081,http://127.0.0.1:8081'),
-  // Stored here for the forthcoming server-side Razorpay adapter. They are not
-  // required until that adapter is enabled, so cash-on-service can launch safely.
-  razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
-  razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET || '',
+  // Payment mode: Cash on Delivery only (online gateway disabled)
+  paymentMode: 'CASH_ON_DELIVERY',
   gmailSenderEmail: process.env.GMAIL_SENDER_EMAIL || '',
   googleOauthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID || '',
   googleOauthClientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET || '',
@@ -160,6 +169,15 @@ module.exports = {
   oneSignalRestApiKey: (process.env.ONESIGNAL_REST_API_KEY || process.env.ONESIGNAL_API_KEY || process.env.ONESIGNAL_KEY || process.env.ONE_SIGNAL_REST_API_KEY || process.env.ONE_SIGNAL_API_KEY || '').trim(),
   oneSignalPartnerAppId: (process.env.ONESIGNAL_PARTNER_APP_ID || process.env.ONESIGNAL_WORKER_APP_ID || '3ad71bb0-508d-4b7d-a09f-64754400c57b').trim(),
   oneSignalPartnerRestApiKey: (process.env.ONESIGNAL_PARTNER_REST_API_KEY || process.env.ONESIGNAL_PARTNER_API_KEY || process.env.ONESIGNAL_PARTNER_KEY || process.env.ONESIGNAL_WORKER_REST_API_KEY || process.env.ONESIGNAL_WORKER_API_KEY || process.env.ONESIGNAL_REST_API_KEY || process.env.ONESIGNAL_API_KEY || process.env.ONESIGNAL_KEY || '').trim(),
+
+  // =========================================
+  // Dedicated Firebase Cloud Messaging (FCM HTTP v1) Configuration
+  // Separate from legacy FIREBASE_* variables so old Firebase services stay untouched
+  // =========================================
+  fcmProjectId: (process.env.FCM_PROJECT_ID || '').trim(),
+  fcmClientEmail: (process.env.FCM_CLIENT_EMAIL || '').trim(),
+  fcmPrivateKey: normalizePrivateKey(process.env.FCM_PRIVATE_KEY),
+  fcmServiceAccountJson: (process.env.FCM_SERVICE_ACCOUNT_JSON || '').trim(),
 
   otpSecret: required('OTP_SECRET', 'dev-otp-secret-long-random-hash-key-homestepin-local', 32),
   nodeEnv,

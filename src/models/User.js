@@ -130,6 +130,7 @@ const userSchema = new mongoose.Schema(
       {
         token: { type: String, required: true },
         deviceId: { type: String },
+        appType: { type: String, enum: ['customer', 'partner'], default: null },
         platform: { type: String, enum: ['android', 'ios', 'web'], default: 'android' },
         lastSeenAt: { type: Date, default: Date.now },
       },

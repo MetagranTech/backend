@@ -121,9 +121,19 @@ async function sendOneSignalRequest(payload, appType = 'customer') {
     };
   }
 
+  // Normalize Android Notification Channel parameters:
+  // In OneSignal REST API:
+  // - android_channel_id: UUID created in OneSignal Dashboard (fails with 400 if not in dashboard)
+  // - existing_android_channel_id: Channel ID created in Android native code (NotificationChannel)
+  const cleanPayload = { ...payload };
+  if (cleanPayload.android_channel_id && !cleanPayload.existing_android_channel_id) {
+    cleanPayload.existing_android_channel_id = cleanPayload.android_channel_id;
+    delete cleanPayload.android_channel_id;
+  }
+
   const bodyData = JSON.stringify({
     app_id: appId,
-    ...payload,
+    ...cleanPayload,
   });
 
   return new Promise((resolve) => {
@@ -147,6 +157,17 @@ async function sendOneSignalRequest(payload, appType = 'customer') {
             const data = JSON.parse(raw);
             if (res.statusCode >= 400) {
               const errorMessage = Array.isArray(data?.errors) ? data.errors.join('; ') : (data?.errors || `OneSignal HTTP ${res.statusCode}`);
+
+              // Resilience Fallback: If OneSignal rejects any channel id (e.g. Could not find android_channel_id),
+              // immediately retry once without channel constraint to guarantee delivery to default channel
+              if (cleanPayload.existing_android_channel_id && errorMessage.toLowerCase().includes('channel_id')) {
+                console.warn(`[OneSignal Channel Fallback] Channel '${cleanPayload.existing_android_channel_id}' rejected by OneSignal for ${appType} (${errorMessage}). Retrying without channel to guarantee delivery...`);
+                const fallbackPayload = { ...cleanPayload };
+                delete fallbackPayload.existing_android_channel_id;
+                delete fallbackPayload.android_channel_id;
+                return resolve(sendOneSignalRequest(fallbackPayload, appType));
+              }
+
               const isTransient = res.statusCode === 429 || res.statusCode >= 500;
               const isPermanent = !isTransient;
               if (process.env.NODE_ENV !== 'test') {
@@ -306,7 +327,7 @@ async function sendNotificationToUser(userId, { title, body, data = {}, sound = 
       correlationId,
     },
     ios_sound: sound,
-    android_channel_id: channelId,
+    existing_android_channel_id: channelId,
     priority: isIncomingCall || data?.priority === 'CRITICAL' ? 10 : 5,
   }, appType);
 
@@ -324,7 +345,7 @@ async function sendNotificationToUser(userId, { title, body, data = {}, sound = 
         correlationId: `${correlationId}_sub_fallback`,
       },
       ios_sound: sound,
-      android_channel_id: channelId,
+      existing_android_channel_id: channelId,
       priority: isIncomingCall || data?.priority === 'CRITICAL' ? 10 : 5,
     }, appType);
 
@@ -360,7 +381,7 @@ async function sendNotificationToSubscriptions(subscriptionIds, { title, body, d
     contents: { en: body },
     data,
     ios_sound: sound,
-    android_channel_id: channelId,
+    existing_android_channel_id: channelId,
   }, appType);
 }
 
@@ -447,7 +468,7 @@ async function notifyJobOfferToWorkers(workerUserIds, booking) {
       bookingId: String(booking.customId || booking._id || booking.id),
       service: booking.service,
     },
-    android_channel_id: 'homestepin_jobs_v2',
+    existing_android_channel_id: 'homestepin_jobs_v2',
     priority: 10,
   }, 'partner');
 }

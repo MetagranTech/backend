@@ -56,7 +56,7 @@ async function verifyPartnerOneSignalIntegration() {
     ['worker_mongoid_101', 'worker_mongoid_102'],
     'Worker external IDs must match MongoDB worker user IDs'
   );
-  assert.strictEqual(lastEntry.payload.android_channel_id, 'homestepin_jobs_v2', 'Channel must be homestepin_jobs_v2');
+  assert.strictEqual(lastEntry.payload.existing_android_channel_id || lastEntry.payload.android_channel_id, 'homestepin_jobs_v2', 'Channel must be homestepin_jobs_v2');
   console.log('✓ Job offer dispatch verified with partner routing and channel');
 
   // 4. Dispatch Direct Worker Alert

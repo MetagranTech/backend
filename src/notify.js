@@ -1,6 +1,7 @@
 const Notification = require('./models/Notification');
 const AuditLog = require('./models/AuditLog');
 const oneSignalService = require('./services/oneSignalService');
+const fcmService = require('./services/fcmService');
 
 async function notify(userId, { title, body, type, booking, data, dedupeKey }) {
   if (dedupeKey) {
@@ -19,28 +20,31 @@ async function notify(userId, { title, body, type, booking, data, dedupeKey }) {
   const io = global.__hsiIo;
   if (io) io.to(`user:${userId}`).emit('notification', serializeNotification(doc));
 
-  // Dispatch background push notification via OneSignal (non-blocking)
+  // Dispatch background push notification: FCM first (when configured + token present), OneSignal fallback
   if (userId) {
     const User = require('./models/User');
     User.findById(userId)
       .select('role')
       .lean()
-      .then(u => {
+      .then(async u => {
         const appType = u?.role === 'worker' ? 'partner' : 'customer';
-        return oneSignalService.sendNotificationToUser(
-          userId,
-          {
-            title,
-            body,
-            data: {
-              ...(data || {}),
-              type,
-              bookingId: booking ? String(booking) : null,
-              notificationId: String(doc._id),
-            },
+        const pushPayload = {
+          title,
+          body,
+          data: {
+            ...(data || {}),
+            type,
+            bookingId: booking ? String(booking) : null,
+            notificationId: String(doc._id),
+            eventId: dedupeKey || String(doc._id),
           },
-          appType
-        );
+        };
+
+        const fcmRes = await fcmService.sendToUser(userId, pushPayload, appType).catch(() => null);
+        if (fcmRes && fcmRes.success && fcmRes.recipients > 0) {
+          return fcmRes;
+        }
+        return oneSignalService.sendNotificationToUser(userId, pushPayload, appType);
       })
       .catch(err => console.warn('[Push Notification Dispatch Warning]:', err.message));
   }

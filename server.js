@@ -17,6 +17,9 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 
 const { connectDb, disconnectDb, getDbHealth } = require('./src/db');
+const { connectFinanceDb, disconnectFinanceDb, getFinanceDbHealth } = require('./src/financeDb');
+const financeService = require('./src/services/financeService');
+global.__hsiEnqueueFinanceCodEvent = financeService.enqueueCodCollectionEvent;
 const config = require('./src/config');
 const { seedDatabase } = require('./src/seed');
 
@@ -72,9 +75,9 @@ const {
   verifyOtpForUser,
 } = otpService;
 const oneSignalService = require('./src/services/oneSignalService');
+const fcmService = require('./src/services/fcmService');
 const resendService = require('./src/services/resendService');
 const couponService = require('./src/services/couponService');
-const razorpayService = require('./src/services/razorpayService');
 const reportingService = require('./src/services/reportingService');
 const cloudinaryService = require('./src/services/cloudinaryService');
 const { handleServiceImageUpload } = require('./src/middleware/serviceImageUpload');
@@ -1193,7 +1196,8 @@ function setupWebSocketServer(httpServer) {
             session.status = 'CALL_CONNECTED';
             session.connectedAt = new Date();
             await session.save();
-            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=accept user=${user.sub}`);
+            const maskId = (id) => (id ? `***${String(id).slice(-4)}` : 'none');
+            console.log(`[CALL_DIAG] callId=${session.callSessionId} event=call_accept caller=${maskId(session.callerId)} callee=${maskId(session.receiverId)} role=${user.role}`);
 
             // Suppress any remaining ringing push notification
             NotificationOutbox.updateMany(
@@ -1215,8 +1219,7 @@ function setupWebSocketServer(httpServer) {
               connectedAt: session.connectedAt.toISOString(),
             };
 
-            // Broadcast to booking room AND all participant user aliases to guarantee delivery
-            broadcastToRoom(session.bookingId, connectedPayload);
+            // Deduplicated broadcast to booking room + participant user aliases
             const participantIds = [
               session.callerId,
               session.receiverId,
@@ -1252,7 +1255,8 @@ function setupWebSocketServer(httpServer) {
               sdp: data.sdp,
               senderId: user.sub,
             };
-            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=offer sender=${user.sub} target=${targetId}`);
+            const maskId = (id) => (id ? `***${String(id).slice(-4)}` : 'none');
+            console.log(`[CALL_DIAG] callId=${session.callSessionId} event=call_offer caller=${maskId(session.callerId)} callee=${maskId(session.receiverId)} sender=${maskId(user.sub)}`);
             const targetUser = await findUserByIdOrIdentifier(targetId);
             const targetAliases = new Set([String(targetId)]);
             if (targetUser) {
@@ -1287,7 +1291,8 @@ function setupWebSocketServer(httpServer) {
               sdp: data.sdp,
               senderId: user.sub,
             };
-            console.log(`[CALL_SIGNALING] callId=${session.callSessionId} action=answer sender=${user.sub} target=${targetId}`);
+            const maskId = (id) => (id ? `***${String(id).slice(-4)}` : 'none');
+            console.log(`[CALL_DIAG] callId=${session.callSessionId} event=call_answer caller=${maskId(session.callerId)} callee=${maskId(session.receiverId)} sender=${maskId(user.sub)}`);
             const targetUser = await findUserByIdOrIdentifier(targetId);
             const targetAliases = new Set([String(targetId)]);
             if (targetUser) {
@@ -1531,6 +1536,7 @@ function createRateLimiter(maxRequests = 100, windowMs = 60000) {
 }
 
 const authRateLimiter = createRateLimiter(process.env.AUTH_RATE_LIMIT ? parseInt(process.env.AUTH_RATE_LIMIT, 10) : 30, 60000);
+const financeRateLimiter = createRateLimiter(30, 60000);
 const generalRateLimiter = createRateLimiter(1000, 60000);
 
 app.use(generalRateLimiter);
@@ -1919,16 +1925,23 @@ async function processOutboxQueue() {
             }
           } catch (_) {}
 
-          const dispatchPromise = oneSignalService.sendNotificationToUser(recipientId, {
+          const pushOpts = {
             title: pushPayload.title,
             body: pushPayload.body,
             data: notificationData,
             sound: pushPayload.sound || 'default',
-          }, appType);
+          };
+          const dispatchPromise = (async () => {
+            const fcmRes = await fcmService.sendToUser(recipientId, pushOpts, appType).catch(() => null);
+            if (fcmRes && fcmRes.success && fcmRes.recipients > 0) {
+              return fcmRes;
+            }
+            return oneSignalService.sendNotificationToUser(recipientId, pushOpts, appType);
+          })();
 
           const dispatchResult = await Promise.race([
             dispatchPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('OneSignal provider dispatch timed out (10s)')), 10000)),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Push provider dispatch timed out (10s)')), 10000)),
           ]);
 
           // Verification of Provider Acceptance:
@@ -5667,306 +5680,170 @@ app.get('/api/availability/slots', async (req, res) => {
 
 app.get('/api/customer/slots', (req, res) => app._router.handle({ ...req, url: '/api/availability/slots' }, res));
 
-// 5. Payment Gateway Configuration, Order Creation, Verification, Status, Webhooks & Refunds
+// 5. Payment Configuration (Cash on Delivery Only) & COD Collection Confirmation
 app.get('/api/payments/config', (req, res) => {
-  const publicConfig = razorpayService.getPublicConfig();
-  return res.json(publicConfig);
+  return res.json({
+    paymentMode: 'CASH_ON_DELIVERY',
+    codOnly: true,
+    onlinePaymentsEnabled: false,
+    currency: 'INR',
+    supportedMethods: ['CASH_ON_DELIVERY'],
+  });
 });
 
-app.post('/api/payments/create-order', authRequired, requireRoles('customer'), async (req, res) => {
-  try {
-    const { bookingId, serviceName, serviceId, addOns, couponCode, quantity, cartItems } = req.body;
-    let authoritativeAmount = 0;
-    let targetBooking = null;
-
-    if (bookingId) {
-      targetBooking = await findBookingById(bookingId);
-      if (!targetBooking) {
-        return res.status(404).json({ error: 'Booking not found.', code: 'BOOKING_NOT_FOUND' });
-      }
-      if (String(targetBooking.customerId) !== String(req.auth.sub)) {
-        return res.status(403).json({ error: 'Unauthorized to pay for this booking.', code: 'PAYMENT_FORBIDDEN' });
-      }
-      if (['PAID', 'Settled', 'Paid Online', 'Paid', 'CAPTURED'].includes(targetBooking.paymentStatus)) {
-        return res.status(400).json({ error: 'This booking has already been paid for.', code: 'ALREADY_PAID' });
-      }
-      if (['CANCELLED', 'EXPIRED', 'DECLINED'].includes(targetBooking.status)) {
-        return res.status(400).json({ error: `Cannot pay for a ${targetBooking.status.toLowerCase()} booking.`, code: 'INVALID_BOOKING_STATUS' });
-      }
-      authoritativeAmount = targetBooking.priceNum || (await calculateAuthoritativePrice(targetBooking.service, targetBooking.addOns, targetBooking.couponCode, 1, targetBooking.cartItems)).totalAmount;
-    } else {
-      // Calculate server-side authoritative price
-      const effectiveService = serviceName || serviceId || (cartItems && cartItems[0] ? (cartItems[0].serviceName || cartItems[0].name) : 'AC Service & Repair');
-      const priceBreakdown = await calculateAuthoritativePrice(effectiveService, addOns, couponCode, quantity || 1, cartItems);
-      authoritativeAmount = priceBreakdown.totalAmount;
-    }
-
-    if (!authoritativeAmount || authoritativeAmount <= 0) {
-      return res.status(400).json({ error: 'Calculated payable amount must be greater than zero.', code: 'INVALID_AMOUNT' });
-    }
-
-    // Check if Razorpay credentials are configured
-    if (!razorpayService.isConfigured()) {
-      return res.status(503).json({
-        error: 'Razorpay payment gateway is not configured. Please set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in the backend environment.',
-        code: 'RAZORPAY_NOT_CONFIGURED',
-      });
-    }
-
-    // Check if there is an existing pending Razorpay order for this booking within last 30 minutes
-    const existingPayment = targetBooking
-      ? await Payment.findOne({
-          bookingId: targetBooking.customId || targetBooking.id,
-          status: 'CREATED',
-          amount: authoritativeAmount,
-          createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) },
-        }).sort({ createdAt: -1 })
-      : null;
-
-    let orderId;
-    let amountInPaise = Math.round(authoritativeAmount * 100);
-    let paymentRecord;
-
-    if (existingPayment && existingPayment.razorpayOrderId) {
-      orderId = existingPayment.razorpayOrderId;
-      paymentRecord = existingPayment;
-    } else {
-      const order = await razorpayService.createOrder({
-        amount: authoritativeAmount,
-        currency: 'INR',
-        receipt: `rcpt_${targetBooking ? (targetBooking.customId || targetBooking.id) : Date.now()}`,
-        notes: {
-          customerId: req.auth.sub,
-          customerName: req.auth.name || 'Customer',
-          bookingId: targetBooking ? (targetBooking.customId || targetBooking.id) : (bookingId || ''),
-          service: serviceName || (targetBooking ? targetBooking.service : 'Home Service'),
-        },
-      });
-      orderId = order.orderId;
-      amountInPaise = order.amountInPaise;
-
-      paymentRecord = await Payment.create({
-        customId: `PAY-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
-        bookingId: targetBooking ? (targetBooking.customId || targetBooking.id) : (bookingId || `BK-TEMP-${Date.now()}`),
-        customerId: req.auth.sub,
-        workerId: targetBooking?.providerId || null,
-        amount: authoritativeAmount,
-        amountSmallestUnit: amountInPaise,
-        currency: 'INR',
-        status: 'CREATED',
-        orderId,
-        razorpayOrderId: orderId,
-        provider: 'Razorpay Gateway',
-        method: 'UPI / Cards / NetBanking',
-      });
-    }
-
-    return res.json({
-      orderId,
-      paymentRecordId: paymentRecord.customId,
-      amount: authoritativeAmount,
-      amountInPaise,
-      currency: 'INR',
-      keyId: (config.razorpayKeyId || process.env.RAZORPAY_KEY_ID || '').trim(),
-      businessName: 'HomeStepIn Technologies Pvt Ltd',
-      description: `Payment for ${serviceName || (targetBooking ? targetBooking.service : 'Home Service')}`,
-    });
-  } catch (err) {
-    console.error('[PAYMENTS] Error creating Razorpay order:', err.message);
-    return res.status(err.status || 500).json({
-      error: err.message || 'Failed to create payment order.',
-      code: err.code || 'PAYMENT_ORDER_CREATION_FAILED',
-    });
-  }
+app.post('/api/payments/create-order', authRequired, (req, res) => {
+  return res.status(410).json({
+    error: 'Online payments have been retired. Cash on Delivery (CASH_ON_DELIVERY) is the only supported payment method.',
+    code: 'ONLINE_PAYMENTS_DISABLED',
+    paymentMode: 'CASH_ON_DELIVERY',
+  });
 });
 
-app.post('/api/payments/verify', authRequired, requireRoles('customer', 'admin'), async (req, res) => {
+app.post('/api/payments/verify', authRequired, (req, res) => {
+  return res.status(410).json({
+    error: 'Online payment verification has been retired. Use Cash on Delivery collection confirmation.',
+    code: 'ONLINE_PAYMENTS_DISABLED',
+    paymentMode: 'CASH_ON_DELIVERY',
+  });
+});
+
+app.post('/api/bookings/:id/cod/collect', authRequired, requireRoles('worker', 'admin'), async (req, res) => {
   try {
-    const orderId = req.body.razorpayOrderId || req.body.orderId || req.body.razorpay_order_id;
-    const paymentId = req.body.razorpayPaymentId || req.body.paymentId || req.body.razorpay_payment_id;
-    const signature = req.body.razorpaySignature || req.body.signature || req.body.razorpay_signature;
-    const bookingId = req.body.bookingId;
-
-    if (!orderId) {
-      return res.status(400).json({ verified: false, error: 'Order ID is required for verification.', code: 'ORDER_ID_REQUIRED' });
-    }
-    if (!paymentId) {
-      return res.status(400).json({ verified: false, error: 'Payment ID is required for verification.', code: 'PAYMENT_ID_REQUIRED' });
+    const booking = await findBookingById(req.params.id);
+    if (!booking) {
+      return res.status(404).json({ error: 'Booking not found.', code: 'BOOKING_NOT_FOUND' });
     }
 
-    if (!razorpayService.isConfigured()) {
-      return res.status(503).json({
-        verified: false,
-        error: 'Razorpay payment gateway is not configured.',
-        code: 'RAZORPAY_NOT_CONFIGURED',
-      });
+    const isAdmin = req.auth.role === 'admin';
+    const authUserIds = [req.auth.sub, req.auth.id, req.auth.customId, req.auth._id].filter(Boolean).map(String);
+    const isAssignedWorker =
+      (booking.providerId && authUserIds.includes(String(booking.providerId))) ||
+      (booking.worker && authUserIds.includes(String(booking.worker)));
+
+    if (!isAdmin && !isAssignedWorker) {
+      return res.status(403).json({ error: 'Unauthorized. Only the assigned partner or an admin can confirm cash collection.', code: 'COD_FORBIDDEN' });
     }
 
-    // Locate the payment record
-    const paymentRecord = await Payment.findOne({
-      $or: [{ razorpayOrderId: orderId }, { orderId }],
-    });
-
-    if (paymentRecord) {
-      // Ownership check: Authenticated customer must own the payment order (admins can verify on behalf)
-      if (req.auth.role !== 'admin' && String(paymentRecord.customerId) !== String(req.auth.sub)) {
-        return res.status(403).json({ verified: false, error: 'Unauthorized. You do not own this payment order.', code: 'PAYMENT_FORBIDDEN' });
-      }
-
-      // Idempotency: If already paid with same paymentId, return success immediately
-      if (['PAID', 'CAPTURED', 'Settled'].includes(paymentRecord.status) && paymentRecord.razorpayPaymentId === paymentId) {
-        return res.json({
-          verified: true,
-          paymentId: paymentRecord.razorpayPaymentId,
-          status: 'PAID',
-          message: 'Payment has already been verified and recorded.',
-        });
-      }
-    }
-
-    // Cryptographic signature check using constant-time comparison
-    const isValidSignature = razorpayService.verifyPaymentSignature({
-      orderId,
-      paymentId,
-      signature,
-    });
-
-    if (!isValidSignature) {
-      if (paymentRecord) {
-        paymentRecord.status = 'FAILED';
-        paymentRecord.failureReason = 'Cryptographic signature mismatch';
-        paymentRecord.errorCode = 'SIGNATURE_VERIFICATION_FAILED';
-        await paymentRecord.save();
-      }
+    const allowedStates = ['WORK_FINISHED', 'CUSTOMER_CONFIRMED', 'COMPLETED', 'PAYMENT_COMPLETED', 'Completed'];
+    if (!allowedStates.includes(booking.status)) {
       return res.status(400).json({
-        verified: false,
-        error: 'Invalid payment signature. Verification failed.',
-        code: 'INVALID_SIGNATURE',
+        error: `Cash collection can only be confirmed after work is finished (current status: ${booking.status}).`,
+        code: 'BOOKING_NOT_COMPLETED',
       });
     }
 
-    // Check payment amount and status from Razorpay API
-    let rzpPaymentDetails = null;
-    try {
-      rzpPaymentDetails = await razorpayService.fetchPayment(paymentId);
-      if (rzpPaymentDetails) {
-        // Validate that order ID matches
-        if (rzpPaymentDetails.order_id && rzpPaymentDetails.order_id !== orderId) {
-          return res.status(400).json({
-            verified: false,
-            error: 'Payment order ID mismatch with Razorpay record.',
-            code: 'ORDER_MISMATCH',
-          });
-        }
-        // Validate currency matches expected INR
-        if (rzpPaymentDetails.currency && rzpPaymentDetails.currency.toUpperCase() !== 'INR') {
-          return res.status(400).json({
-            verified: false,
-            error: `Payment currency (${rzpPaymentDetails.currency}) mismatch. Expected INR.`,
-            code: 'CURRENCY_MISMATCH',
-          });
-        }
-        // Validate amount matches expected order amount
-        if (paymentRecord && paymentRecord.amount) {
-          const paidRupees = (rzpPaymentDetails.amount || 0) / 100;
-          if (paidRupees !== paymentRecord.amount) {
-            return res.status(400).json({
-              verified: false,
-              error: `Paid amount (₹${paidRupees}) does not match expected amount (₹${paymentRecord.amount}).`,
-              code: 'AMOUNT_MISMATCH',
-            });
-          }
-        }
-      }
-    } catch (rzpErr) {
-      // In testing environments with mock/local keys, allow verified signature to succeed
-      console.warn('[PAYMENTS] Note: Unable to fetch live payment from Razorpay API:', rzpErr.message);
+    if (['PAID', 'COD_COLLECTED', 'CAPTURED', 'SETTLED', 'Settled'].includes(booking.paymentStatus)) {
+      return res.status(409).json({
+        error: 'Cash collection has already been confirmed for this booking.',
+        code: 'COD_ALREADY_COLLECTED',
+        paymentStatus: booking.paymentStatus,
+      });
     }
 
-    // Atomically transition payment record to PAID
-    if (paymentRecord) {
-      paymentRecord.status = 'PAID';
-      paymentRecord.paymentId = paymentId;
-      paymentRecord.razorpayPaymentId = paymentId;
-      paymentRecord.razorpaySignature = signature || paymentRecord.razorpaySignature;
-      paymentRecord.method = rzpPaymentDetails?.method || paymentRecord.method || 'Razorpay Online';
-      paymentRecord.paidAt = new Date();
-      await paymentRecord.save();
+    const authoritativeAmount = Number(booking.priceNum) || (typeof booking.price === 'string' ? parseFloat(booking.price.replace(/[^0-9.]/g, '')) : 0) || 0;
+    if (authoritativeAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid booking amount for COD collection.', code: 'INVALID_AMOUNT' });
     }
 
-    // Update associated booking
-    const effectiveBookingId = bookingId || paymentRecord?.bookingId;
-    let targetBooking = null;
-    if (effectiveBookingId) {
-      targetBooking = await findBookingById(effectiveBookingId);
-      if (targetBooking) {
-        if (req.auth.role !== 'admin' && String(targetBooking.customerId) !== String(req.auth.sub)) {
-          return res.status(403).json({ verified: false, error: 'Unauthorized to update this booking.', code: 'BOOKING_FORBIDDEN' });
-        }
-        const prevStatus = targetBooking.paymentStatus;
-        targetBooking.paymentStatus = 'PAID';
-        targetBooking.paymentMethod = 'Pay Online';
-        if (Array.isArray(targetBooking.history)) {
-          targetBooking.history.push({
-            from: prevStatus || 'PENDING',
+    const collectedAt = new Date();
+    const collectedBy = String(req.auth.sub);
+
+    const lockedBooking = await Booking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        paymentStatus: { $nin: ['PAID', 'COD_COLLECTED', 'CAPTURED', 'SETTLED', 'Settled'] },
+      },
+      {
+        $set: {
+          paymentMethod: 'CASH_ON_DELIVERY',
+          paymentStatus: 'PAID',
+          codCollectedAt: collectedAt,
+          codCollectedBy: collectedBy,
+          codConfirmedAmount: authoritativeAmount,
+        },
+        $push: {
+          history: {
+            from: booking.paymentStatus || 'PENDING',
             to: 'PAID',
-            by: req.auth.sub,
+            by: collectedBy,
             role: req.auth.role,
-            action: 'PAYMENT_VERIFIED',
-            note: `Razorpay payment ${paymentId} verified for order ${orderId}`,
-            at: new Date(),
-          });
-        }
-        await targetBooking.save();
+            action: 'COD_COLLECTED',
+            note: `Partner confirmed Cash on Delivery collection of ₹${authoritativeAmount}`,
+            at: collectedAt,
+          },
+        },
+      },
+      { new: true }
+    );
 
-        await logFinancialAudit('PAYMENT_VERIFIED', paymentRecord?.customId || targetBooking.customId, req.auth.sub, req.auth.role, paymentRecord?.amount || targetBooking.priceNum || 0, {
-          orderId,
-          paymentId,
-          bookingId: targetBooking.customId || targetBooking.id,
-        });
+    if (!lockedBooking) {
+      return res.status(409).json({
+        error: 'Cash collection was already confirmed concurrently.',
+        code: 'COD_ALREADY_COLLECTED',
+      });
+    }
 
-        if (targetBooking.providerId) {
-          await createAndDispatchNotification({
-            recipientId: targetBooking.providerId,
-            eventId: `evt_pay_${paymentId}`,
-            type: 'PAYMENT_COMPLETED',
-            priority: 'IMPORTANT',
-            title: 'Customer Paid Online',
-            body: `Booking #${targetBooking.customId || targetBooking.id} paid online (₹${paymentRecord?.amount || targetBooking.priceNum}). Do not collect cash.`,
-            bookingId: targetBooking.customId || targetBooking.id,
-          });
-        }
+    const bookingKey = lockedBooking.customId || String(lockedBooking._id);
+    const workerKey = String(lockedBooking.providerId || lockedBooking.worker || collectedBy);
 
-        const customerRecipientId = targetBooking.customerId || (targetBooking.customer ? String(targetBooking.customer) : '');
-        if (customerRecipientId) {
-          await createAndDispatchNotification({
-            recipientId: customerRecipientId,
-            eventId: `evt_pay_cust_${paymentId}`,
-            type: 'PAYMENT_SUCCESS',
-            priority: 'IMPORTANT',
-            title: 'Payment Successful',
-            body: `Your payment of ₹${paymentRecord?.amount || targetBooking.priceNum} for Booking #${targetBooking.customId || targetBooking.id} was successful.`,
-            bookingId: targetBooking.customId || targetBooking.id,
-          }).catch(e => console.warn('[Payment Success Push] Warning:', e.message));
-        }
-      }
+    let paymentRecord = await Payment.findOne({ bookingId: bookingKey, method: 'CASH_ON_DELIVERY' });
+    if (!paymentRecord) {
+      paymentRecord = await Payment.create({
+        customId: `COD-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
+        bookingId: bookingKey,
+        customerId: String(lockedBooking.customerId || lockedBooking.customer || ''),
+        workerId: workerKey,
+        amount: authoritativeAmount,
+        amountSmallestUnit: Math.round(authoritativeAmount * 100),
+        currency: 'INR',
+        status: 'COD_COLLECTED',
+        provider: 'Cash on Delivery',
+        method: 'CASH_ON_DELIVERY',
+        collectedBy,
+        collectedAt,
+        paidAt: collectedAt,
+      });
+    }
+
+    await logFinancialAudit('COD_COLLECTED', bookingKey, collectedBy, req.auth.role, authoritativeAmount, {
+      paymentId: paymentRecord.customId,
+      workerId: workerKey,
+    });
+
+    if (lockedBooking.customerId) {
+      await createAndDispatchNotification({
+        recipientId: lockedBooking.customerId,
+        eventId: `evt_cod_paid_${bookingKey}`,
+        type: 'PAYMENT_SUCCESS',
+        priority: 'NORMAL',
+        title: 'Cash Payment Confirmed',
+        body: `Cash payment of ₹${authoritativeAmount} for Booking #${bookingKey} has been confirmed.`,
+        bookingId: bookingKey,
+      }).catch(() => {});
+    }
+
+    if (typeof global.__hsiEnqueueFinanceCodEvent === 'function') {
+      await global.__hsiEnqueueFinanceCodEvent({
+        booking: lockedBooking,
+        payment: paymentRecord,
+        collectedBy,
+        collectedAt,
+      }).catch(err => console.warn('[Finance Outbox Enqueue Warning]:', err.message));
     }
 
     return res.json({
-      verified: true,
-      paymentId,
-      orderId,
-      bookingId: targetBooking?.customId || targetBooking?.id || effectiveBookingId,
-      status: 'PAID',
-      message: 'Payment verified and captured successfully.',
+      success: true,
+      message: `Cash collection of ₹${authoritativeAmount} confirmed.`,
+      bookingId: bookingKey,
+      amount: authoritativeAmount,
+      paymentStatus: lockedBooking.paymentStatus,
+      paymentMethod: lockedBooking.paymentMethod,
+      codCollectedAt: collectedAt,
+      payment: paymentRecord,
     });
   } catch (err) {
-    console.error('[PAYMENTS] Error verifying payment:', err.message);
-    return res.status(err.status || 500).json({
-      verified: false,
-      error: err.message || 'Payment verification failed.',
-      code: err.code || 'VERIFICATION_ERROR',
-    });
+    console.error('[COD_COLLECT_ERR]:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to confirm COD collection.' });
   }
 });
 
@@ -6027,167 +5904,12 @@ app.get('/api/payments/:paymentId/status', authRequired, async (req, res) => {
   }
 });
 
-// Razorpay Secure Webhook Endpoint
-app.post('/api/payments/webhook', async (req, res) => {
-  try {
-    const signature = req.headers['x-razorpay-signature'];
-    if (!signature) {
-      return res.status(400).json({ error: 'Missing x-razorpay-signature header' });
-    }
-
-    const isValid = razorpayService.verifyWebhookSignature({
-      rawBody: req.rawBody,
-      signature,
-    });
-
-    if (!isValid) {
-      console.warn('[WEBHOOK] Rejected webhook request: Invalid signature');
-      return res.status(400).json({ error: 'Invalid webhook signature.' });
-    }
-
-    const event = req.body.event;
-    const eventId = req.headers['x-razorpay-event-id'] || req.body.event_id || `evt_${event}_${req.body.payload?.payment?.entity?.id || Date.now()}`;
-
-    // Idempotency: Atomically reserve event processing key upfront to prevent concurrent delivery race conditions
-    try {
-      await IdempotencyKey.create({
-        customerId: 'system_webhook',
-        idempotencyKey: eventId,
-        requestHash: crypto.createHash('sha256').update(String(req.rawBody || eventId)).digest('hex'),
-        status: 'IN_FLIGHT',
-        response: { status: 'in_flight' },
-        statusCode: 200,
-      });
-    } catch (dupErr) {
-      if (dupErr.code === 11000 || (dupErr.message && dupErr.message.includes('E11000'))) {
-        return res.json({ status: 'ok', message: 'Event already processed' });
-      }
-      throw dupErr;
-    }
-
-    // Process event
-    if (event === 'payment.captured' || event === 'order.paid') {
-      const paymentEntity = req.body.payload?.payment?.entity;
-      if (paymentEntity) {
-        const orderId = paymentEntity.order_id;
-        const paymentId = paymentEntity.id;
-        const paymentRecord = await Payment.findOne({
-          $or: [{ razorpayOrderId: orderId }, { orderId }],
-        });
-
-        if (paymentRecord) {
-          paymentRecord.status = 'PAID';
-          paymentRecord.paymentId = paymentId;
-          paymentRecord.razorpayPaymentId = paymentId;
-          paymentRecord.method = paymentEntity.method || paymentRecord.method;
-          paymentRecord.paidAt = new Date(paymentEntity.created_at ? paymentEntity.created_at * 1000 : Date.now());
-          if (!paymentRecord.webhookEventsProcessed.includes(eventId)) {
-            paymentRecord.webhookEventsProcessed.push(eventId);
-          }
-          await paymentRecord.save();
-
-          const booking = await findBookingById(paymentRecord.bookingId);
-          if (booking && booking.paymentStatus !== 'PAID') {
-            booking.paymentStatus = 'PAID';
-            booking.paymentMethod = 'Pay Online';
-            if (Array.isArray(booking.history)) {
-              booking.history.push({
-                from: 'PENDING',
-                to: 'PAID',
-                by: 'webhook',
-                role: 'system',
-                action: 'PAYMENT_WEBHOOK_CAPTURED',
-                note: `Payment ${paymentId} captured via Razorpay Webhook`,
-                at: new Date(),
-              });
-            }
-            await booking.save();
-          }
-        }
-      }
-    } else if (event === 'payment.authorized') {
-      const paymentEntity = req.body.payload?.payment?.entity;
-      if (paymentEntity) {
-        const orderId = paymentEntity.order_id;
-        const paymentRecord = await Payment.findOne({
-          $or: [{ razorpayOrderId: orderId }, { orderId }],
-        });
-        if (paymentRecord && paymentRecord.status !== 'PAID') {
-          paymentRecord.status = 'AUTHORIZED';
-          paymentRecord.paymentId = paymentEntity.id;
-          paymentRecord.razorpayPaymentId = paymentEntity.id;
-          await paymentRecord.save();
-        }
-      }
-    } else if (event === 'payment.failed') {
-      const paymentEntity = req.body.payload?.payment?.entity;
-      if (paymentEntity) {
-        const orderId = paymentEntity.order_id;
-        const paymentRecord = await Payment.findOne({
-          $or: [{ razorpayOrderId: orderId }, { orderId }],
-        });
-        if (paymentRecord && paymentRecord.status !== 'PAID') {
-          paymentRecord.status = 'FAILED';
-          paymentRecord.errorCode = paymentEntity.error_code || 'PAYMENT_FAILED';
-          paymentRecord.failureReason = paymentEntity.error_description || 'Payment failed';
-          await paymentRecord.save();
-
-          const booking = await findBookingById(paymentRecord.bookingId);
-          if (booking && booking.paymentStatus === 'PENDING') {
-            booking.paymentStatus = 'FAILED';
-            await booking.save();
-          }
-
-          if (booking && (booking.customerId || booking.customer)) {
-            await createAndDispatchNotification({
-              recipientId: booking.customerId || booking.customer,
-              eventId: `evt_pay_fail_${paymentEntity.id || orderId}`,
-              type: 'PAYMENT_FAILED',
-              priority: 'IMPORTANT',
-              title: 'Payment Failed',
-              body: `Payment for Booking #${booking.customId || booking.id} failed. Please retry your payment.`,
-              bookingId: booking.customId || booking.id,
-            }).catch(e => console.warn('[Payment Failed Push] Warning:', e.message));
-          }
-        }
-      }
-    } else if (event === 'refund.processed' || event === 'refund.created') {
-      const refundEntity = req.body.payload?.refund?.entity;
-      if (refundEntity) {
-        const paymentId = refundEntity.payment_id;
-        const paymentRecord = await Payment.findOne({
-          $or: [{ razorpayPaymentId: paymentId }, { paymentId }],
-        });
-        if (paymentRecord) {
-          paymentRecord.status = 'REFUNDED';
-          paymentRecord.refundId = refundEntity.id;
-          paymentRecord.refundAmount = (refundEntity.amount || 0) / 100;
-          paymentRecord.refundStatus = refundEntity.status === 'processed' ? 'REFUNDED' : 'PROCESSING';
-          paymentRecord.refundedAt = new Date();
-          await paymentRecord.save();
-
-          const booking = await findBookingById(paymentRecord.bookingId);
-          if (booking) {
-            booking.paymentStatus = 'REFUNDED';
-            booking.refundStatus = refundEntity.status === 'processed' ? 'REFUNDED' : 'PROCESSING';
-            booking.refundAmount = paymentRecord.refundAmount;
-            await booking.save();
-          }
-        }
-      }
-    }
-
-    // Finalize idempotency key status
-    await IdempotencyKey.updateOne(
-      { customerId: 'system_webhook', idempotencyKey: eventId },
-      { $set: { status: 'COMPLETED', response: { status: 'ok' }, statusCode: 200 } }
-    );
-
-    return res.json({ status: 'ok' });
-  } catch (err) {
-    console.error('[WEBHOOK] Error processing Razorpay webhook:', err.message);
-    return res.status(500).json({ error: 'Internal webhook error' });
-  }
+// Historical webhook endpoint retired (COD-only mode)
+app.post('/api/payments/webhook', (req, res) => {
+  return res.status(410).json({
+    error: 'Online payment webhooks have been retired. HomeStepIn operates on Cash on Delivery (CASH_ON_DELIVERY) only.',
+    code: 'ONLINE_PAYMENTS_DISABLED',
+  });
 });
 
 // Customer/Admin Refund Processing Endpoint
@@ -6273,53 +5995,15 @@ app.post('/api/payments/refund', authRequired, async (req, res) => {
       });
     }
 
-    let rzpRefundResult = null;
-    if (razorpayService.isConfigured() && (lockedPayment.razorpayPaymentId || (lockedPayment.paymentId && lockedPayment.paymentId.startsWith('pay_')))) {
-      try {
-        rzpRefundResult = await razorpayService.refundPayment({
-          paymentId: lockedPayment.razorpayPaymentId || lockedPayment.paymentId,
-          amount: refundAmount,
-          notes: {
-            reason: reason || 'Customer dispute resolution',
-            requestedBy: req.auth.sub,
-            bookingId: lockedPayment.bookingId,
-          },
-        });
-      } catch (rzpErr) {
-        console.error('[REFUND] Razorpay refund error:', rzpErr.message);
-        // Rollback lock to previous status and record manual review requirement
-        lockedPayment.status = (lockedPayment.refundAmount || 0) > 0 ? 'PARTIALLY_REFUNDED' : 'PAID';
-        lockedPayment.refundStatus = 'MANUAL_REVIEW_REQUIRED';
-        lockedPayment.failureReason = `Provider refund error: ${rzpErr.message}`;
-        await lockedPayment.save();
-
-        await logFinancialAudit('REFUND_FAILED_MANUAL_REVIEW', lockedPayment.customId, req.auth.sub, req.auth.role, refundAmount, {
-          reason,
-          error: rzpErr.message,
-          manualReview: true,
-        });
-
-        return res.status(502).json({
-          error: `Automated provider refund failed (${rzpErr.message}). Operation logged for manual review.`,
-          code: 'REFUND_MANUAL_REVIEW_REQUIRED',
-        });
-      }
-    }
-
     const totalRefunded = (lockedPayment.refundAmount || 0) + refundAmount;
     const isFullyRefunded = totalRefunded >= lockedPayment.amount;
     const finalPaymentStatus = isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
-    const finalRefundStatus = rzpRefundResult
-      ? (rzpRefundResult.status === 'processed' ? (isFullyRefunded ? 'REFUNDED' : 'PARTIAL') : 'PROCESSING')
-      : (isFullyRefunded ? 'REFUNDED' : 'PARTIAL');
+    const finalRefundStatus = isFullyRefunded ? 'REFUNDED' : 'PARTIAL';
 
     lockedPayment.status = finalPaymentStatus;
     lockedPayment.refundAmount = totalRefunded;
     lockedPayment.refundReason = reason || 'Customer dispute / policy refund';
     lockedPayment.refundedAt = new Date();
-    if (rzpRefundResult) {
-      lockedPayment.refundId = rzpRefundResult.refundId;
-    }
     lockedPayment.refundStatus = finalRefundStatus;
     await lockedPayment.save();
 
@@ -6706,8 +6390,8 @@ async function handleCreateBooking(req, res) {
     priceBreakdown,
     status: BOOKING_STATES.CONFIRMED,
     startOtp: generatedOtp,
-    paymentStatus,
-    paymentMethod: paymentMethod || 'Pay Online',
+    paymentStatus: 'PENDING',
+    paymentMethod: 'CASH_ON_DELIVERY',
     serviceAreaCode: coverageCheck.serviceAreaCode || 'TRICHY_CENTRAL',
     isServiceAreaVerified: true,
   });
@@ -6913,20 +6597,28 @@ async function handleCreateBooking(req, res) {
       const title = 'New Service Request Available! ⚡';
       const body = `New ${newBooking.service} job in ${newBooking.area || newBooking.city || 'Trichy'} (${formattedDistance}). Payout: ${payoutFormatted}`;
 
-      oneSignalService.sendNotificationToUser(workerIdStr, {
-        title,
-        body,
-        data: {
-          type: 'NEW_JOB_OFFER',
-          bookingId: String(newBooking.customId),
-          service: newBooking.service,
-          category: newBooking.category,
-          payout: payoutFormatted,
-          distance: formattedDistance,
-          deepLink: `homestepin://bookings/${newBooking.customId}`,
-        },
-        sound: 'homestepin_notification.wav',
-      }, 'partner').then(async (dispatchRes) => {
+      (async () => {
+        const directPayload = {
+          title,
+          body,
+          data: {
+            type: 'NEW_JOB_OFFER',
+            bookingId: String(newBooking.customId),
+            service: newBooking.service,
+            category: newBooking.category,
+            payout: payoutFormatted,
+            distance: formattedDistance,
+            deepLink: `homestepin://bookings/${newBooking.customId}`,
+            eventId: `evt_offer_${newBooking.customId}_${workerIdStr}`,
+          },
+          sound: 'homestepin_notification.wav',
+        };
+        const fcmRes = await fcmService.sendToUser(workerIdStr, directPayload, 'partner').catch(() => null);
+        if (fcmRes && fcmRes.success && fcmRes.recipients > 0) {
+          return fcmRes;
+        }
+        return oneSignalService.sendNotificationToUser(workerIdStr, directPayload, 'partner');
+      })().then(async (dispatchRes) => {
         console.log(`[BOOKING_PARTNER_PUSH] bookingId=${newBooking.customId} workerId=${workerIdStr} success=${dispatchRes?.success} recipients=${dispatchRes?.recipients} providerId=${dispatchRes?.id || 'none'}`);
         if (dispatchRes && dispatchRes.success && dispatchRes.recipients > 0) {
           await NotificationOutbox.updateOne(
@@ -7023,7 +6715,7 @@ async function handleCreateBooking(req, res) {
         return wDoc.customId || (wDoc._id ? wDoc._id.toString() : null) || wDoc.id;
       })
       .filter(Boolean);
-    if (workerTargetIds.length > 0) {
+    if (workerTargetIds.length > 0 && !fcmService.isConfigured()) {
       oneSignalService
         .notifyJobOfferToWorkers(workerTargetIds, newBooking)
         .catch(err => console.warn('[OneSignal Job Dispatch Warning]:', err.message));
@@ -7502,28 +7194,30 @@ async function transitionBooking(bookingId, action, actor, payload = {}) {
   } else if (action === 'FINISH_WORK') {
     booking.status = targetStatus;
     booking.finishedAt = new Date();
-    const payoutAmount = Math.round((booking.priceNum || 500) * 0.8);
-    await User.updateOne(
-      { _id: booking.worker || booking.providerId },
-      { $inc: { todayEarnings: payoutAmount, walletBalance: payoutAmount } }
-    );
+    // Do NOT mark paymentStatus as PAID or credit earnings before COD collection confirmation
+    if (!['PAID', 'COD_COLLECTED', 'CAPTURED', 'SETTLED', 'Settled'].includes(booking.paymentStatus)) {
+      booking.paymentStatus = 'PENDING';
+    }
     try {
       await createOrUpdatePassportAndGuarantee(booking);
     } catch (e) {}
 
-    await addSystemMessage(booking.customId || booking.id, `Service marked as finished. Please review & rate your professional.`);
+    await addSystemMessage(booking.customId || booking.id, `Service marked as finished. Please pay ₹${booking.priceNum || 0} in cash to your partner.`);
     await createAndDispatchNotification({
       recipientId: booking.customerId,
       eventId: `evt_finish_${booking.customId || booking.id}`,
       type: 'WORK_COMPLETED',
       priority: 'IMPORTANT',
       title: 'Service Completed',
-      body: `Work completed by ${booking.providerName}. Please inspect and confirm completion.`,
+      body: `Work completed by ${booking.providerName}. Please pay ₹${booking.priceNum || 0} in cash to confirm completion.`,
       bookingId: booking.customId || booking.id,
     });
   } else if (action === 'CONFIRM_COMPLETION') {
     booking.status = targetStatus;
-    booking.paymentStatus = 'Settled';
+    // Preserve PAID only if COD collection was already confirmed
+    if (!['PAID', 'COD_COLLECTED', 'CAPTURED', 'SETTLED', 'Settled'].includes(booking.paymentStatus)) {
+      booking.paymentStatus = 'PENDING';
+    }
     try {
       await createOrUpdatePassportAndGuarantee(booking);
     } catch (e) {}
@@ -7535,7 +7229,7 @@ async function transitionBooking(bookingId, action, actor, payload = {}) {
         type: 'COMPLETION_CONFIRMED',
         priority: 'IMPORTANT',
         title: 'Completion Confirmed',
-        body: `Customer confirmed completion for #${booking.customId || booking.id}. Payment credited.`,
+        body: `Customer confirmed completion for #${booking.customId || booking.id}. Please confirm cash collection if not already recorded.`,
         bookingId: booking.customId || booking.id,
       });
     }
@@ -10064,6 +9758,21 @@ app.post('/api/bookings/:id/call/:callSessionId/accept', authRequired, async (re
     });
   }
 
+  if (session.status === 'CALL_ENDED') {
+    return res.status(409).json({ error: 'Call has already ended.', code: 'CALL_ALREADY_ENDED' });
+  }
+
+  if (session.status === 'CALL_CONNECTED') {
+    const activeIceServers = resolveWebRtcIceServers(req.auth);
+    return res.json({
+      success: true,
+      alreadyConnected: true,
+      status: 'CALL_CONNECTED',
+      connectedAt: session.connectedAt,
+      iceServers: activeIceServers,
+    });
+  }
+
   session.status = 'CALL_CONNECTED';
   session.connectedAt = new Date();
   await session.save();
@@ -10202,57 +9911,71 @@ app.get('/api/webrtc/ice-servers', authRequired, (req, res) => {
 
 // Register Device Push / OneSignal Subscription Token (Multi-Device Safe & JWT-Authenticated)
 async function handleRegisterPushToken(req, res) {
-  const token = req.body.token || req.body.subscriptionId || req.body.playerId || req.body.pushToken;
-  const { deviceId, platform } = req.body;
-  if (!token) return res.status(400).json({ error: 'Push subscription token string is required.' });
+  const token = req.body.token || req.body.subscriptionId || req.body.pushToken || req.body.fcmToken;
+  const explicitFcmToken = req.body.fcmToken ? String(req.body.fcmToken).trim() : null;
+  const platform = req.body.platform || 'android';
+  const deviceId = req.body.deviceId;
+  if (!token && !explicitFcmToken) return res.status(400).json({ error: 'Push subscription token string is required.' });
 
   const user = await findUserByIdOrIdentifier(req.auth.sub);
   if (!user) return res.status(404).json({ error: 'User not found.' });
 
-  const cleanToken = String(token).trim();
+  const cleanToken = token ? String(token).trim() : explicitFcmToken;
   const cleanPlatform = ['android', 'ios', 'web'].includes(platform) ? platform : 'android';
   const cleanDeviceId = deviceId || `dev_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
+  const reqAppType = String(req.body.appType || '').toLowerCase();
+  const resolvedAppType = ['customer', 'partner'].includes(reqAppType)
+    ? reqAppType
+    : ((user.role === 'worker' || user.role === 'partner') ? 'partner' : 'customer');
 
-  // 1. Update pushSubscriptions (OneSignal)
-  if (!user.pushSubscriptions) user.pushSubscriptions = [];
-  const existingSubIdx = user.pushSubscriptions.findIndex(
-    s => s.subscriptionId === cleanToken || (deviceId && s.deviceId === deviceId)
-  );
-  if (existingSubIdx !== -1) {
-    user.pushSubscriptions[existingSubIdx].subscriptionId = cleanToken;
-    if (deviceId) user.pushSubscriptions[existingSubIdx].deviceId = cleanDeviceId;
-    user.pushSubscriptions[existingSubIdx].platform = cleanPlatform;
-    user.pushSubscriptions[existingSubIdx].lastSeenAt = new Date();
-  } else {
-    user.pushSubscriptions.push({
-      subscriptionId: cleanToken,
-      deviceId: cleanDeviceId,
-      platform: cleanPlatform,
-      lastSeenAt: new Date(),
-    });
-  }
-  if (user.pushSubscriptions.length > 10) {
-    user.pushSubscriptions = user.pushSubscriptions.slice(-10);
+  // 1. Update pushSubscriptions (OneSignal) when a subscription token is provided
+  if (cleanToken) {
+    if (!user.pushSubscriptions) user.pushSubscriptions = [];
+    const existingSubIdx = user.pushSubscriptions.findIndex(
+      s => s.subscriptionId === cleanToken || (deviceId && s.deviceId === deviceId)
+    );
+    if (existingSubIdx !== -1) {
+      user.pushSubscriptions[existingSubIdx].subscriptionId = cleanToken;
+      if (deviceId) user.pushSubscriptions[existingSubIdx].deviceId = cleanDeviceId;
+      user.pushSubscriptions[existingSubIdx].platform = cleanPlatform;
+      user.pushSubscriptions[existingSubIdx].lastSeenAt = new Date();
+    } else {
+      user.pushSubscriptions.push({
+        subscriptionId: cleanToken,
+        deviceId: cleanDeviceId,
+        platform: cleanPlatform,
+        lastSeenAt: new Date(),
+      });
+    }
+    if (user.pushSubscriptions.length > 10) {
+      user.pushSubscriptions = user.pushSubscriptions.slice(-10);
+    }
   }
 
-  // 2. Backward compatibility mirror in fcmTokens
-  if (!user.fcmTokens) user.fcmTokens = [];
-  const existingFcmIdx = user.fcmTokens.findIndex(
-    t => t.token === cleanToken || (deviceId && t.deviceId === deviceId)
-  );
-  if (existingFcmIdx !== -1) {
-    user.fcmTokens[existingFcmIdx].token = cleanToken;
-    user.fcmTokens[existingFcmIdx].lastSeenAt = new Date();
-  } else {
-    user.fcmTokens.push({
-      token: cleanToken,
-      deviceId: cleanDeviceId,
-      platform: cleanPlatform,
-      lastSeenAt: new Date(),
-    });
-  }
-  if (user.fcmTokens.length > 10) {
-    user.fcmTokens = user.fcmTokens.slice(-10);
+  // 2. Store real FCM token with strict appType separation
+  const fcmCandidate = explicitFcmToken || (cleanToken && !cleanToken.startsWith('dev_') && cleanToken.length > 40 ? cleanToken : null);
+  if (fcmCandidate) {
+    if (!user.fcmTokens) user.fcmTokens = [];
+    const existingFcmIdx = user.fcmTokens.findIndex(
+      t => t.token === fcmCandidate || (deviceId && t.deviceId === deviceId && (!t.appType || t.appType === resolvedAppType))
+    );
+    if (existingFcmIdx !== -1) {
+      user.fcmTokens[existingFcmIdx].token = fcmCandidate;
+      user.fcmTokens[existingFcmIdx].appType = resolvedAppType;
+      user.fcmTokens[existingFcmIdx].platform = cleanPlatform;
+      user.fcmTokens[existingFcmIdx].lastSeenAt = new Date();
+    } else {
+      user.fcmTokens.push({
+        token: fcmCandidate,
+        deviceId: cleanDeviceId,
+        appType: resolvedAppType,
+        platform: cleanPlatform,
+        lastSeenAt: new Date(),
+      });
+    }
+    if (user.fcmTokens.length > 10) {
+      user.fcmTokens = user.fcmTokens.slice(-10);
+    }
   }
 
   // 3. Mark worker as online upon active push subscription registration
@@ -10277,7 +10000,8 @@ app.post('/api/auth/fcm-token', authRequired, handleRegisterPushToken);
 
 // Deregister Device Push Token (Logout & Account Switching Safety)
 async function handleDeregisterPushToken(req, res) {
-  const token = req.body.token || req.body.subscriptionId || req.body.pushToken || req.query.token;
+  const token = req.body.token || req.body.subscriptionId || req.body.pushToken || req.body.fcmToken || req.query.token;
+  const fcmToken = req.body.fcmToken ? String(req.body.fcmToken).trim() : null;
   const deviceId = req.body.deviceId || req.query.deviceId;
 
   const user = await findUserByIdOrIdentifier(req.auth.sub);
@@ -10289,7 +10013,7 @@ async function handleDeregisterPushToken(req, res) {
     }
     if (user.fcmTokens) {
       user.fcmTokens = user.fcmTokens.filter(
-        t => (token ? t.token !== String(token).trim() : true) && (deviceId ? t.deviceId !== deviceId : true)
+        t => (token ? t.token !== String(token).trim() : true) && (fcmToken ? t.token !== fcmToken : true) && (deviceId ? t.deviceId !== deviceId : true)
       );
     }
     await user.save();
@@ -10331,6 +10055,7 @@ app.get('/api/notifications/public-config', async (req, res) => {
     customerConfigured: Boolean(customerConfig.isConfigured),
     partnerConfigured: Boolean(partnerConfig.isConfigured),
     partnerHasDedicatedKey: Boolean(process.env.ONESIGNAL_PARTNER_REST_API_KEY && process.env.ONESIGNAL_PARTNER_REST_API_KEY !== process.env.ONESIGNAL_REST_API_KEY),
+    fcm: fcmService.getFcmStatus(),
     envKeyScan,
   };
 
@@ -13256,8 +12981,8 @@ app.get('/api/admin/financials', authRequired, requireRoles('admin'), async (req
       amount: Number(b.priceNum) || (typeof b.price === 'string' ? parseFloat(b.price.replace(/[^0-9.]/g, '')) : 0) || 0,
       currency: 'INR',
       status: 'PAID',
-      method: b.paymentMethod || 'Online / UPI',
-      provider: b.paymentMethod?.includes('Cash') ? 'Cash on Service' : 'Razorpay Gateway',
+      method: b.paymentMethod || 'CASH_ON_DELIVERY',
+      provider: (b.paymentMethod?.includes('Cash') || b.paymentMethod === 'CASH_ON_DELIVERY') ? 'Cash on Delivery' : 'Historical Online Gateway',
       createdAt: b.createdAt,
     }));
 
@@ -13350,56 +13075,15 @@ app.post('/api/admin/financials/refund', authRequired, requireRoles('admin'), as
     });
   }
 
-  let rzpRefundResult = null;
-  // If this payment was captured via Razorpay, call the official Razorpay Refund API
-  if (lockedPayment && (lockedPayment.razorpayPaymentId || (lockedPayment.paymentId && lockedPayment.paymentId.startsWith('pay_')))) {
-    if (razorpayService.isConfigured()) {
-      try {
-        rzpRefundResult = await razorpayService.refundPayment({
-          paymentId: lockedPayment.razorpayPaymentId || lockedPayment.paymentId,
-          amount: refundAmt,
-          notes: {
-            reason: reason || 'Admin processed refund',
-            adminId: req.auth.sub,
-            bookingId: lockedPayment.bookingId,
-          },
-        });
-      } catch (rzpErr) {
-        console.error('[REFUND] Admin Razorpay refund API error:', rzpErr.message);
-        // Rollback lock and record manual review requirement
-        lockedPayment.status = (lockedPayment.refundAmount || 0) > 0 ? 'PARTIALLY_REFUNDED' : 'PAID';
-        lockedPayment.refundStatus = 'MANUAL_REVIEW_REQUIRED';
-        lockedPayment.failureReason = `Provider refund error: ${rzpErr.message}`;
-        await lockedPayment.save();
-
-        await logFinancialAudit('ADMIN_REFUND_FAILED_MANUAL_REVIEW', lockedPayment.customId, req.auth.sub, 'admin', refundAmt, {
-          reason,
-          error: rzpErr.message,
-          manualReview: true,
-        });
-
-        return res.status(502).json({
-          error: `Razorpay refund API failed: ${rzpErr.message}. Logged for manual operational review.`,
-          code: 'RAZORPAY_REFUND_FAILED',
-        });
-      }
-    }
-  }
-
   const totalRefunded = (lockedPayment.refundAmount || 0) + refundAmt;
   const isFullyRefunded = totalRefunded >= lockedPayment.amount;
   const finalPaymentStatus = isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
-  const finalRefundStatus = rzpRefundResult
-    ? (rzpRefundResult.status === 'processed' ? (isFullyRefunded ? 'REFUNDED' : 'PARTIAL') : 'PROCESSING')
-    : (isFullyRefunded ? 'REFUNDED' : 'PARTIAL');
+  const finalRefundStatus = isFullyRefunded ? 'REFUNDED' : 'PARTIAL';
 
   lockedPayment.status = finalPaymentStatus;
   lockedPayment.refundAmount = totalRefunded;
   lockedPayment.refundReason = reason || 'Customer service dispute resolution';
   lockedPayment.refundedAt = new Date();
-  if (rzpRefundResult) {
-    lockedPayment.refundId = rzpRefundResult.refundId;
-  }
   lockedPayment.refundStatus = finalRefundStatus;
   await lockedPayment.save();
 
@@ -13441,7 +13125,6 @@ app.post('/api/admin/financials/refund', authRequired, requireRoles('admin'), as
     refundAmount: refundAmt,
     totalRefunded,
     remainingRefundable: Math.max(0, lockedPayment.amount - totalRefunded),
-    razorpayRefund: rzpRefundResult,
   });
 });
 
@@ -14377,6 +14060,131 @@ async function cleanLegacyCustomerAddresses() {
   }
 }
 
+// ── Dual-MongoDB Financial Management APIs (Partner & Admin) ─────────
+app.get('/api/partner/finance/summary', authRequired, requireRoles('worker'), async (req, res) => {
+  try {
+    const summary = await financeService.getPartnerFinancialSummary(req.auth.sub);
+    return res.json(summary);
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to load partner financial summary.', code: err.code });
+  }
+});
+
+app.get('/api/partner/finance/history', authRequired, requireRoles('worker'), async (req, res) => {
+  try {
+    const { page, limit, startDate, endDate } = req.query;
+    const history = await financeService.getPartnerFinancialHistory(req.auth.sub, { page, limit, startDate, endDate });
+    return res.json(history);
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to load partner financial history.', code: err.code });
+  }
+});
+
+app.post('/api/partner/finance/settlements', authRequired, requireRoles('worker'), financeRateLimiter, async (req, res) => {
+  try {
+    const { amount, paymentMethod, utrReference, paymentProofUrl, notes, idempotencyKey } = req.body;
+    const settlement = await financeService.submitPartnerSettlement(req.auth.sub, {
+      amount,
+      paymentMethod,
+      utrReference,
+      paymentProofUrl,
+      notes,
+      idempotencyKey,
+    });
+    return res.status(201).json({ success: true, settlement });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to submit settlement request.', code: err.code });
+  }
+});
+
+app.get('/api/admin/finance/overview', authRequired, requireRoles('admin'), async (req, res) => {
+  try {
+    const overview = await financeService.getAdminFinanceOverview();
+    return res.json({ ...overview, financeDb: getFinanceDbHealth() });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to load admin finance overview.', code: err.code });
+  }
+});
+
+app.get('/api/admin/finance/partners/:partnerId', authRequired, requireRoles('admin'), async (req, res) => {
+  try {
+    const details = await financeService.getAdminPartnerAccount(req.params.partnerId);
+    const partnerUser = await findUserByIdOrIdentifier(req.params.partnerId).catch(() => null);
+    return res.json({
+      ...details,
+      partnerProfile: partnerUser
+        ? { id: String(partnerUser._id), name: partnerUser.name, email: partnerUser.email, phone: partnerUser.phone, employeeId: partnerUser.employeeId }
+        : null,
+    });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to load partner financial account.', code: err.code });
+  }
+});
+
+app.post('/api/admin/finance/settlements/:settlementId/review', authRequired, requireRoles('admin'), financeRateLimiter, async (req, res) => {
+  try {
+    const { action, reason } = req.body;
+    const settlement = await financeService.reviewSettlement(req.params.settlementId, {
+      action,
+      adminId: req.auth.sub,
+      reason,
+    });
+    return res.json({ success: true, settlement });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to review settlement.', code: err.code });
+  }
+});
+
+app.post('/api/admin/finance/adjustments', authRequired, requireRoles('admin'), financeRateLimiter, async (req, res) => {
+  try {
+    const { partnerId, type, amount, reason, idempotencyKey } = req.body;
+    const adjustment = await financeService.createAdminAdjustment({
+      partnerId,
+      type,
+      amount,
+      reason,
+      adminId: req.auth.sub,
+      idempotencyKey,
+    });
+    return res.status(201).json({ success: true, adjustment });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to create financial adjustment.', code: err.code });
+  }
+});
+
+app.get('/api/admin/finance/commission', authRequired, requireRoles('admin'), async (req, res) => {
+  try {
+    const commission = await financeService.getActiveCommissionConfig();
+    return res.json({ commission });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to fetch commission config.', code: err.code });
+  }
+});
+
+app.post('/api/admin/finance/commission', authRequired, requireRoles('admin'), financeRateLimiter, async (req, res) => {
+  try {
+    const { ratePercent, effectiveFrom, reason } = req.body;
+    const commission = await financeService.setCommissionConfig({
+      ratePercent,
+      effectiveFrom,
+      adminId: req.auth.sub,
+      reason,
+    });
+    return res.status(201).json({ success: true, commission });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to update commission config.', code: err.code });
+  }
+});
+
+app.post('/api/admin/finance/reconcile', authRequired, requireRoles('admin'), financeRateLimiter, async (req, res) => {
+  try {
+    const result = await financeService.reconcileFinanceDatabase({ BookingModel: Booking, PaymentModel: Payment });
+    return res.json({ success: true, result, financeDb: getFinanceDbHealth() });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to reconcile finance database.', code: err.code });
+  }
+});
+
 // ── Server Startup with Persistent Database Initialization ───────────
 let serverInstance = null;
 
@@ -14385,6 +14193,8 @@ async function startServer() {
     assertProductionSafety();
     console.log('[HomeStepIn Backend] Initializing database connection...');
     await connectDb();
+    await connectFinanceDb().catch(err => console.warn("[Finance MongoDB Startup Warning]:", err.message));
+    setInterval(() => { financeService.processFinanceOutbox().catch(() => {}); }, 30000).unref();
     await User.init().catch(err => console.warn('[User Index Init Warning]:', err.message));
     await bootstrapDefaultTrichyArea().catch(err => console.warn('[ServiceArea Bootstrap Warning]:', err.message));
     await User.updateMany(
@@ -14401,6 +14211,7 @@ async function startServer() {
     ).catch(err => console.warn('[ChatLock Backfill Warning]:', err));
     await cleanLegacyCustomerAddresses().catch(err => console.warn('[Clean Addresses Warning]:', err));
 
+    fcmService.initFcmApp();
     const resendStatus = resendService.validateResendConfig();
     if (resendStatus.configured) {
       console.log(`[Resend Service] Customer Email OTP delivery initialized (Sender: ${resendStatus.senderEmail})`);
@@ -14434,6 +14245,7 @@ async function handleGracefulShutdown(signal) {
   console.log(`[HomeStepIn Server] Received ${signal}. Starting graceful shutdown...`);
   try {
     if (serverInstance) serverInstance.close();
+    await disconnectFinanceDb();
     await disconnectDb();
     console.log('[HomeStepIn Server] Database disconnected cleanly. Exiting.');
     process.exit(0);

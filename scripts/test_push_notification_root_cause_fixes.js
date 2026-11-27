@@ -143,7 +143,7 @@ async function runTests() {
     assert.strictEqual(dispatchedRequests.length, 1, 'Partner dispatch request sent');
     assert.strictEqual(dispatchedRequests[0].appType, 'partner', 'Must target Partner OneSignal app');
     assert.ok(dispatchedRequests[0].payload.include_aliases.external_id.includes('wrk_test_2001'), 'Must include worker customId');
-    assert.strictEqual(dispatchedRequests[0].payload.android_channel_id, 'homestepin_jobs_v2', 'Must use jobs channel');
+    assert.strictEqual(dispatchedRequests[0].payload.existing_android_channel_id || dispatchedRequests[0].payload.android_channel_id, 'homestepin_jobs_v2', 'Must use jobs channel');
     console.log('  [PASS] Partner job offer routes to Partner app with high priority channel');
     passedCount++;
 
