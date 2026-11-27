@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const { MongoMemoryServer } = require('mongodb-memory-server');
 
 let financeConnection = null;
 let financeMemoryServer = null;
@@ -67,6 +66,7 @@ async function connectFinanceDb(options = {}) {
     }
 
     if (!targetUri && isTest) {
+      const { MongoMemoryServer } = require('mongodb-memory-server');
       financeMemoryServer = await MongoMemoryServer.create({
         instance: { dbName: 'homestepin_finance_test' },
       });
